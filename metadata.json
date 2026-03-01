@@ -1,0 +1,5 @@
+{
+  "name": "AeroForge",
+  "description": "Parametric design tool for 3D printing drone chassis",
+  "requestFramePermissions": []
+}
