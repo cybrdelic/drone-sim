@@ -1093,14 +1093,15 @@ export function DroneModel({
     -massProps.comMm.y,
     -massProps.comMm.z,
   ];
-  // Spawn high enough to avoid strong ground effect (and immediate ground contact).
-  // Ground effect model applies up to ~2*rotorRadius = one prop diameter.
+  // Flight sim should start on the ground, stationary.
+  // Ground plane top surface is at y=0 (mm). Place the cuboid collider so its bottom
+  // just touches the ground (slight epsilon avoids initial penetration).
   const flightSpawnLiftY = useMemo(() => {
-    const baseMm = assemblySpawnLiftY + massProps.comMm.y;
-    const propDiameterMm = propSize * 25.4;
-    const minMm = propDiameterMm + 150;
-    return Math.max(baseMm, minMm);
-  }, [assemblySpawnLiftY, massProps.comMm.y, propSize]);
+    const halfY = assemblyHalfExtents[1];
+    const colliderLocalY = assemblyColliderCenterY - massProps.comMm.y;
+    const epsilonMm = 0.2;
+    return halfY - colliderLocalY + epsilonMm;
+  }, [assemblyHalfExtents[1], assemblyColliderCenterY, massProps.comMm.y]);
 
   // Compute the correct collider density so Rapier gets the right total mass.
   // Volume of the cuboid = 8 * hx * hy * hz (in mm³ since world is mm-scale).
@@ -1214,6 +1215,7 @@ export function DroneModel({
     velM: new THREE.Vector3(0, 0, 0),
     quat: new THREE.Quaternion(),
     omegaBody: new THREE.Vector3(0, 0, 0),
+    armed: false as boolean,
     motorOmegaRad: [0, 0, 0, 0] as number[],
     motorTiltRad: [0, 0, 0, 0] as number[],
     motorPhaseRad: [0, 0, 0, 0] as number[],
@@ -1227,13 +1229,40 @@ export function DroneModel({
     windTime: 0 as number,
   });
 
+  const prevViewModeRef = useRef(viewMode);
+
   React.useEffect(() => {
+    const prev = prevViewModeRef.current;
+    prevViewModeRef.current = viewMode;
+
+    // Reset flight state when ENTERING flight sim.
+    // This guarantees a consistent start: on the ground, not moving, motors disarmed.
+    if (prev !== "flight_sim" && viewMode === "flight_sim") {
+      flightInitDone.current = false;
+      flightState.current.posM.set(0, 0, 0);
+      flightState.current.velM.set(0, 0, 0);
+      flightState.current.omegaBody.set(0, 0, 0);
+      flightState.current.quat.identity();
+      flightState.current.armed = false;
+      flightState.current.motorOmegaRad = [0, 0, 0, 0];
+      flightState.current.motorTiltRad = [0, 0, 0, 0];
+      flightState.current.motorPhaseRad = [0, 0, 0, 0];
+      flightState.current.batteryV = propulsion.batteryCells * propulsion.vOpenPerCell;
+      flightState.current.batteryI = 0;
+      flightState.current.throttle01 = 0;
+      flightState.current.targetWpIndex = 1;
+      flightState.current.rng = 123456789;
+      flightState.current.windPhase = null;
+      flightState.current.windTime = 0;
+    }
+
     // Reset flight state when leaving flight sim or when a new flight starts.
     if (viewMode !== "flight_sim") {
       flightState.current.posM.set(0, 0, 0);
       flightState.current.velM.set(0, 0, 0);
       flightState.current.omegaBody.set(0, 0, 0);
       flightState.current.quat.identity();
+      flightState.current.armed = false;
       flightState.current.motorOmegaRad = [0, 0, 0, 0];
       flightState.current.motorTiltRad = [0, 0, 0, 0];
       flightState.current.motorPhaseRad = [0, 0, 0, 0];
@@ -1307,6 +1336,7 @@ export function DroneModel({
           body.setLinvel({ x: 0, y: 0, z: 0 }, true);
           body.setAngvel({ x: 0, y: 0, z: 0 }, true);
           body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+          s.armed = false;
           flightInitDone.current = true;
         } catch {
           // If Rapier is in a bad state (e.g. after a hot reload), avoid crashing the render loop.
@@ -1396,6 +1426,8 @@ export function DroneModel({
       );
 
       if (isFlyingPath && waypoints.length >= 2) {
+        // Autopilot implies the motors are armed.
+        s.armed = true;
         const idx = Math.min(
           Math.max(1, s.targetWpIndex),
           waypoints.length - 1,
@@ -1488,12 +1520,20 @@ export function DroneModel({
         // Manual: throttle around hover + stick input
         const sens = THREE.MathUtils.clamp(controlSensitivity, 0.2, 1);
         const throttleDelta = (keys.current.space ? 1 : 0) - (keys.current.shift ? 1 : 0);
-        // Neutral throttle aims for hover, but small modeling biases can create a slow climb/sink.
-        // Add a light vertical-velocity damper when the user is not actively commanding throttle.
-        const kVzDamp = 0.045; // throttle fraction per (m/s) vertical speed
-        const vzDamp = throttleDelta === 0 ? THREE.MathUtils.clamp(-s.velM.y * kVzDamp, -0.08, 0.08) : 0;
-        const targetThrottle = hoverThrottle01 + throttleDelta * (0.18 * sens) + vzDamp;
-        throttleCmd01 = clamp01(targetThrottle);
+        // Start on the ground with motors off until the user commands throttle-up.
+        if (!s.armed) {
+          if (throttleDelta > 0) s.armed = true;
+          throttleCmd01 = 0;
+          desiredRateBody.set(0, 0, 0);
+        } else {
+          // Neutral throttle aims for hover, but small modeling biases can create a slow climb/sink.
+          // Add a light vertical-velocity damper when the user is not actively commanding throttle.
+          const kVzDamp = 0.045; // throttle fraction per (m/s) vertical speed
+          const vzDamp = throttleDelta === 0
+            ? THREE.MathUtils.clamp(-s.velM.y * kVzDamp, -0.08, 0.08)
+            : 0;
+          const targetThrottle = hoverThrottle01 + throttleDelta * (0.18 * sens) + vzDamp;
+          throttleCmd01 = clamp01(targetThrottle);
 
         const pitchCmd = (keys.current.s ? 1 : 0) - (keys.current.w ? 1 : 0);
         const rollCmd = (keys.current.a ? 1 : 0) - (keys.current.d ? 1 : 0);
@@ -1541,19 +1581,26 @@ export function DroneModel({
           levelRateBody.add(dampRateBody);
         }
 
-        // Blend: stick input overrides self-level on the corresponding axis
-        desiredRateBody.set(
-          pitchCmd !== 0 ? pitchCmd * maxPitchRate : levelRateBody.x,
-          yawCmd * maxYawRate,
-          rollCmd !== 0 ? rollCmd * maxRollRate : levelRateBody.z,
-        );
+          // Blend: stick input overrides self-level on the corresponding axis
+          desiredRateBody.set(
+            pitchCmd !== 0 ? pitchCmd * maxPitchRate : levelRateBody.x,
+            yawCmd * maxYawRate,
+            rollCmd !== 0 ? rollCmd * maxRollRate : levelRateBody.z,
+          );
+        }
       }
 
       // Smooth throttle (motor spool)
       {
-        const tau = 0.12;
-        const a = 1 - Math.exp(-dt / tau);
-        s.throttle01 = THREE.MathUtils.lerp(s.throttle01, throttleCmd01, a);
+        if (!s.armed) {
+          // Motors off on the ground until armed.
+          s.throttle01 = 0;
+          s.motorOmegaRad = [0, 0, 0, 0];
+        } else {
+          const tau = 0.12;
+          const a = 1 - Math.exp(-dt / tau);
+          s.throttle01 = THREE.MathUtils.lerp(s.throttle01, throttleCmd01, a);
+        }
       }
 
       // Motor positions relative to COM (body), including deterministic tolerance offsets.
@@ -1797,12 +1844,16 @@ export function DroneModel({
           const weightN = massKg * g;
           const thrustN = Math.max(0, thrustWorld.y);
           const tw = weightN > 1e-6 ? thrustN / weightN : 0;
+          // Report altitude as height above ground (AGL) of the collider bottom.
+          const colliderLocalY = assemblyColliderCenterY - massProps.comMm.y; // mm
+          const bottomAGLM =
+            s.posM.y + (colliderLocalY - assemblyHalfExtents[1]) * 1e-3;
           flightTelemetryRef.current = {
             throttle01: s.throttle01,
             thrustN,
             weightN,
             tw,
-            altitudeM: s.posM.y,
+            altitudeM: Math.max(0, bottomAGLM),
             speedMS: s.velM.length(),
           };
         }
@@ -2653,7 +2704,7 @@ export function DroneModel({
       type="dynamic"
       colliders={false}
       ref={viewMode === "flight_sim" ? flightBodyRef : undefined}
-      canSleep={viewMode === "flight_sim" ? false : undefined}
+      canSleep={true}
       mass={massProps.massKg}
       friction={1.1}
       restitution={0.05}
