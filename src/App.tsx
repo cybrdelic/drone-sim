@@ -1,17 +1,18 @@
-import React, { useState, useRef, useMemo } from "react";
-import { Canvas } from "@react-three/fiber";
 import {
-  OrbitControls,
-  Environment,
-  Grid,
-  ContactShadows,
-  Line,
+    ContactShadows,
+    Environment,
+    Grid,
+    OrbitControls,
 } from "@react-three/drei";
+import { Canvas } from "@react-three/fiber";
+import { CuboidCollider, Physics, RigidBody } from "@react-three/rapier";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { STLExporter } from "three/examples/jsm/exporters/STLExporter.js";
-import { Sidebar } from "./components/Sidebar";
 import { DroneModel } from "./components/DroneModel";
-import { DroneParams } from "./types";
+import { RapierDebugLines } from "./components/RapierDebugLines";
+import { Sidebar } from "./components/Sidebar";
+import { DebugSettings, DroneParams, FlightTelemetry, SimSettings, ViewSettings } from "./types";
 
 const defaultParams: DroneParams = {
   frameSize: 210, // 5-inch standard
@@ -34,6 +35,370 @@ export default function App() {
   const groupRef = useRef<THREE.Group>(null);
   const [waypoints, setWaypoints] = useState<THREE.Vector3[]>([]);
   const [isFlyingPath, setIsFlyingPath] = useState(false);
+  const [controlSensitivity, setControlSensitivity] = useState(0.45);
+  const [debugSettings, setDebugSettings] = useState<DebugSettings>({
+    physicsLines: false,
+    flightTelemetry: false,
+  });
+  const [viewSettings, setViewSettings] = useState<ViewSettings>({
+    wireframe: false,
+    focus: "all",
+    visibility: {
+      frame: true,
+      propulsion: true,
+      electronics: true,
+      accessories: true,
+    },
+  });
+  const [simSettings, setSimSettings] = useState<SimSettings>({
+    motorAudioEnabled: false,
+    motorAudioVolume: 0.35,
+    vibrationAmount: 0.35,
+  });
+  const [presetId, setPresetId] = useState<
+    "oval" | "figure8" | "corkscrew" | "loop"
+  >("oval");
+  const flightTelemetryRef = useRef<FlightTelemetry>({
+    throttle01: 0,
+    thrustN: 0,
+    weightN: 0,
+    tw: 0,
+    altitudeM: 0,
+    speedMS: 0,
+  });
+  const [flightTelemetry, setFlightTelemetry] = useState<FlightTelemetry>(
+    flightTelemetryRef.current,
+  );
+
+  const paramsRef = useRef(params);
+  const viewSettingsRef = useRef(viewSettings);
+  const simSettingsRef = useRef(simSettings);
+  const debugSettingsRef = useRef(debugSettings);
+  const waypointsRef = useRef(waypoints);
+  const isFlyingPathRef = useRef(isFlyingPath);
+
+  useEffect(() => {
+    paramsRef.current = params;
+  }, [params]);
+  useEffect(() => {
+    viewSettingsRef.current = viewSettings;
+  }, [viewSettings]);
+  useEffect(() => {
+    simSettingsRef.current = simSettings;
+  }, [simSettings]);
+  useEffect(() => {
+    debugSettingsRef.current = debugSettings;
+  }, [debugSettings]);
+  useEffect(() => {
+    waypointsRef.current = waypoints;
+  }, [waypoints]);
+  useEffect(() => {
+    isFlyingPathRef.current = isFlyingPath;
+  }, [isFlyingPath]);
+
+  useEffect(() => {
+    // Debug-bridge client: silently attaches to the local MCP debug server.
+    // No UI, no console steps required. Safe to run even if the server isn't present.
+    let ws: WebSocket | null = null;
+    let stopped = false;
+    let retry = 0;
+    const BRIDGE_VERSION = 2;
+    let lastPatchAppliedMs = 0;
+    let lastPatchKeys: string[] = [];
+    let lastPatchSummary = "";
+    let lastPatchMetaSummary = "";
+
+    const safeSummary = (value: any, maxLen = 1800) => {
+      try {
+        const s = JSON.stringify(
+          value,
+          (_k, v) => {
+            if (typeof v === "function") return "[Function]";
+            if (typeof AbortSignal !== "undefined" && v instanceof AbortSignal) {
+              return `[AbortSignal aborted=${v.aborted}]`;
+            }
+            if (v instanceof Error) return `[Error ${v.message}]`;
+            if (v && typeof v === "object") {
+              const ctor = (v as any)?.constructor?.name;
+              if (ctor && ctor !== "Object" && ctor !== "Array") return `[${ctor}]`;
+            }
+            return v;
+          },
+          2,
+        );
+        return typeof s === "string" ? s.slice(0, maxLen) : String(s);
+      } catch {
+        try {
+          return String(value).slice(0, maxLen);
+        } catch {
+          return "[Unserializable]";
+        }
+      }
+    };
+
+    const respond = (id: string, payload: any) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ id, ...payload }));
+    };
+
+    const snapshot = () => {
+      return {
+        debugBridge: {
+          version: BRIDGE_VERSION,
+          lastPatchAppliedMs,
+          lastPatchKeys,
+          lastPatchSummary,
+          lastPatchMetaSummary,
+        },
+        params: paramsRef.current,
+        viewSettings: viewSettingsRef.current,
+        simSettings: simSettingsRef.current,
+        debugSettings: debugSettingsRef.current,
+        waypoints: waypointsRef.current.map((p) => ({ x: p.x, y: p.y, z: p.z })),
+        isFlyingPath: isFlyingPathRef.current,
+        flightTelemetry: flightTelemetryRef.current,
+      };
+    };
+
+    const applyPatch = (patch: any) => {
+      // Some tool runners wrap the actual patch under `signal` and attach metadata.
+      // Accept both shapes:
+      // - { params, viewSettings, ... }
+      // - { signal: { params, ... }, _meta, requestId }
+      lastPatchSummary = safeSummary(patch);
+      lastPatchMetaSummary = safeSummary(patch?._meta);
+
+      const effectivePatch = patch;
+
+      lastPatchAppliedMs = Date.now();
+      lastPatchKeys =
+        effectivePatch && typeof effectivePatch === "object"
+          ? Object.keys(effectivePatch)
+          : [];
+      // Keep both React state and the snapshot refs in sync.
+      // This makes MCP reads immediately reflect MCP writes, even before effects run.
+      if (effectivePatch?.params) {
+        const next = { ...paramsRef.current, ...effectivePatch.params };
+        paramsRef.current = next;
+        setParams(next);
+      }
+      if (effectivePatch?.viewSettings) {
+        const next = { ...viewSettingsRef.current, ...effectivePatch.viewSettings };
+        viewSettingsRef.current = next;
+        setViewSettings(next);
+      }
+      if (effectivePatch?.simSettings) {
+        const next = { ...simSettingsRef.current, ...effectivePatch.simSettings };
+        simSettingsRef.current = next;
+        setSimSettings(next);
+      }
+      if (effectivePatch?.debugSettings) {
+        const next = { ...debugSettingsRef.current, ...effectivePatch.debugSettings };
+        debugSettingsRef.current = next;
+        setDebugSettings(next);
+      }
+      if (Array.isArray(effectivePatch?.waypoints)) {
+        const next = effectivePatch.waypoints.map(
+          (p: any) => new THREE.Vector3(p.x, p.y, p.z),
+        );
+        waypointsRef.current = next;
+        setWaypoints(next);
+      }
+      if (typeof effectivePatch?.isFlyingPath === "boolean") {
+        isFlyingPathRef.current = effectivePatch.isFlyingPath;
+        setIsFlyingPath(effectivePatch.isFlyingPath);
+      }
+    };
+
+    const connect = () => {
+      if (stopped) return;
+      const delay = Math.min(2000, 150 * Math.pow(1.6, retry++));
+
+      try {
+        ws = new WebSocket("ws://127.0.0.1:8787");
+      } catch {
+        window.setTimeout(connect, delay);
+        return;
+      }
+
+      ws.onopen = () => {
+        retry = 0;
+        try {
+          ws?.send(
+            JSON.stringify({
+              type: "hello",
+              client: "drone-sim",
+              ts: Date.now(),
+              href: typeof window !== "undefined" ? window.location.href : undefined,
+            }),
+          );
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onmessage = (ev) => {
+        const raw = typeof ev.data === "string" ? ev.data : "";
+        let msg: any;
+        try {
+          msg = JSON.parse(raw);
+        } catch {
+          return;
+        }
+
+        const id = typeof msg?.id === "string" ? msg.id : null;
+        if (!id) return;
+
+        // Support alternate envelopes from debug tooling.
+        // Some tools send { command: { type, ... } } instead of { type, ... }.
+        const command = msg?.command && typeof msg.command === "object" ? msg.command : msg;
+        const type = command?.type;
+
+        if (type === "get_state") {
+          respond(id, { ok: true, state: snapshot() });
+          return;
+        }
+
+        if (type === "set_state") {
+          try {
+            // Accept either { patch: {...} } or a direct patch payload.
+            applyPatch(command.patch ?? command ?? {});
+            // Respond with a snapshot so tool callers can verify that the patch stuck.
+            respond(id, { ok: true, state: snapshot() });
+          } catch (e: any) {
+            respond(id, { ok: false, error: e?.message ?? String(e) });
+          }
+          return;
+        }
+
+        respond(id, { ok: false, error: "Unknown command" });
+      };
+
+      ws.onclose = () => {
+        if (stopped) return;
+        window.setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => {
+        try {
+          ws?.close();
+        } catch {
+          // ignore
+        }
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      try {
+        ws?.close();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!debugSettings.flightTelemetry) return;
+    const id = window.setInterval(() => {
+      setFlightTelemetry({ ...flightTelemetryRef.current });
+    }, 200);
+    return () => window.clearInterval(id);
+  }, [debugSettings.flightTelemetry]);
+
+  const presetWaypoints = useMemo(() => {
+    // Generate in world coordinates (mm). DroneModel autopilot converts to meters internally.
+    const r = Math.max(300, params.frameSize * 2); // mm
+    const h = Math.max(250, params.frameSize * 1.2); // mm
+
+    const makeOval = () => {
+      const pts: THREE.Vector3[] = [];
+      const n = 36;
+      const rx = r * 1.2;
+      const rz = r * 0.8;
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n) * Math.PI * 2;
+        pts.push(new THREE.Vector3(Math.cos(t) * rx, 220, Math.sin(t) * rz));
+      }
+      return pts;
+    };
+
+    const makeFigure8 = () => {
+      const pts: THREE.Vector3[] = [];
+      const n = 60;
+      // Lemniscate-ish in XZ
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n) * Math.PI * 2;
+        const denom = 1 + Math.sin(t) * Math.sin(t);
+        const x = (r * Math.cos(t)) / denom;
+        const z = (r * Math.sin(t) * Math.cos(t)) / denom;
+        pts.push(new THREE.Vector3(x * 1.6, 240, z * 2.2));
+      }
+      return pts;
+    };
+
+    const makeCorkscrew = () => {
+      const pts: THREE.Vector3[] = [];
+      const turns = 2.5;
+      const n = 80;
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n) * Math.PI * 2 * turns;
+        const y = 140 + (i / n) * h;
+        pts.push(new THREE.Vector3(Math.cos(t) * r, y, Math.sin(t) * r));
+      }
+      return pts;
+    };
+
+    const makeVerticalLoop = () => {
+      const pts: THREE.Vector3[] = [];
+      const n = 44;
+      const loopR = Math.max(220, r * 0.75);
+      // Loop in YZ plane, moving forward in Z while looping
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n) * Math.PI * 2;
+        const y = 200 + Math.sin(t) * loopR;
+        const z = -r * 0.6 + Math.cos(t) * loopR;
+        pts.push(new THREE.Vector3(0, Math.max(40, y), z));
+      }
+      return pts;
+    };
+
+    const presets = {
+      oval: makeOval(),
+      figure8: makeFigure8(),
+      corkscrew: makeCorkscrew(),
+      loop: makeVerticalLoop(),
+    } as const;
+
+    return presets;
+  }, [params.frameSize]);
+
+  const flightPathPoints = useMemo(() => {
+    if (waypoints.length < 2) return [];
+    return waypoints.map(
+      (p) => new THREE.Vector3(p.x, Math.max(p.y + 20, 20), p.z),
+    );
+  }, [waypoints]);
+
+  const flightPathLine = useMemo(() => {
+    if (flightPathPoints.length < 2) return null;
+    const geometry = new THREE.BufferGeometry().setFromPoints(flightPathPoints);
+    const material = new THREE.LineBasicMaterial({ color: "#10b981" });
+    return new THREE.Line(geometry, material);
+  }, [flightPathPoints]);
+
+  useEffect(() => {
+    return () => {
+      if (!flightPathLine) return;
+      flightPathLine.geometry.dispose();
+      if (Array.isArray(flightPathLine.material)) {
+        for (const material of flightPathLine.material) material.dispose();
+      } else {
+        flightPathLine.material.dispose();
+      }
+    };
+  }, [flightPathLine]);
 
   const handleExport = () => {
     if (!groupRef.current) return;
@@ -129,7 +494,18 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-full bg-[#0a0a0a] overflow-hidden font-sans text-neutral-200">
-      <Sidebar params={params} onChange={setParams} onExport={handleExport} />
+      <Sidebar
+        params={params}
+        onChange={setParams}
+        onExport={handleExport}
+        viewSettings={viewSettings}
+        onViewSettingsChange={setViewSettings}
+        simSettings={simSettings}
+        onSimSettingsChange={setSimSettings}
+        debugSettings={debugSettings}
+        onDebugSettingsChange={setDebugSettings}
+        flightTelemetry={flightTelemetry}
+      />
 
       <main className="flex-1 relative cursor-move">
         {/* Frame Specs Panel (Top Left) */}
@@ -277,6 +653,45 @@ export default function App() {
         {params.viewMode === "flight_sim" && (
           <>
             <div className="absolute top-24 left-1/2 -translate-x-1/2 z-10 flex gap-4 pointer-events-auto">
+              <div className="bg-neutral-900/80 text-neutral-400 px-3 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center gap-2">
+                <span className="text-neutral-500">Preset</span>
+                <select
+                  value={presetId}
+                  onChange={(e) => setPresetId(e.target.value as any)}
+                  disabled={isFlyingPath}
+                  className="bg-neutral-900 border border-neutral-700 text-neutral-200 text-xs px-2 py-1 rounded outline-none focus:border-emerald-500 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <option value="oval">Oval</option>
+                  <option value="figure8">Figure 8</option>
+                  <option value="corkscrew">Corkscrew</option>
+                  <option value="loop">Vertical Loop</option>
+                </select>
+                <button
+                  className="bg-neutral-800 border border-neutral-700 text-white px-3 py-1.5 rounded text-xs hover:bg-neutral-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  onClick={() => setWaypoints(presetWaypoints[presetId].map((p) => p.clone()))}
+                  disabled={isFlyingPath}
+                >
+                  Load
+                </button>
+              </div>
+
+              <div className="bg-neutral-900/80 text-neutral-400 px-3 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center gap-2">
+                <span className="text-neutral-500">Control</span>
+                <input
+                  type="range"
+                  min={0.2}
+                  max={1}
+                  step={0.05}
+                  value={controlSensitivity}
+                  onChange={(e) => setControlSensitivity(parseFloat(e.target.value))}
+                  disabled={isFlyingPath}
+                  className="w-28 h-1.5 bg-neutral-800 rounded-full appearance-none cursor-pointer disabled:opacity-50 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-400 hover:[&::-webkit-slider-thumb]:bg-emerald-300"
+                />
+                <span className="text-[11px] font-mono text-emerald-400 w-10 text-right">
+                  {(controlSensitivity * 100).toFixed(0)}%
+                </span>
+              </div>
+
               <button
                 className="bg-neutral-800 border border-neutral-700 text-white px-4 py-2 rounded text-xs hover:bg-neutral-700 transition-colors"
                 onClick={() => setWaypoints([])}
@@ -299,7 +714,7 @@ export default function App() {
               <div className="bg-[#111]/90 backdrop-blur border border-emerald-500/30 p-4 rounded-lg shadow-[0_0_30px_rgba(16,185,129,0.1)] flex items-center gap-8">
                 <div className="text-center">
                   <div className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-2">
-                    Throttle / Yaw
+                    Pitch / Roll
                   </div>
                 <div className="grid grid-cols-3 gap-1">
                   <div />
@@ -321,7 +736,7 @@ export default function App() {
               <div className="w-[1px] h-16 bg-neutral-800" />
               <div className="text-center">
                 <div className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-2">
-                  Altitude / Rotation
+                  Throttle / Yaw
                 </div>
                 <div className="grid grid-cols-3 gap-1">
                   <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
@@ -345,7 +760,16 @@ export default function App() {
           </>
         )}
 
-        <Canvas camera={{ position: [120, 100, 120], fov: 45 }} shadows>
+        <Canvas
+          camera={{ position: [120, 100, 120], fov: 45, near: 0.1, far: 100000 }}
+          onCreated={({ camera }) => {
+            camera.near = 0.1;
+            camera.far = 100000;
+            camera.updateProjectionMatrix();
+          }}
+          gl={{ logarithmicDepthBuffer: true }}
+          shadows="percentage"
+        >
           <color attach="background" args={["#0a0a0a"]} />
           <ambientLight intensity={0.4} />
           <directionalLight
@@ -357,58 +781,61 @@ export default function App() {
           />
           <Environment preset="studio" />
 
-          <DroneModel
-            params={params}
-            groupRef={groupRef}
-            waypoints={waypoints}
-            isFlyingPath={isFlyingPath}
-            onFlightComplete={() => setIsFlyingPath(false)}
-          />
+          <Physics gravity={[0, -9810, 0]}>
+            {debugSettings.physicsLines && <RapierDebugLines />}
+            {/* Ground collider (scene units are mm) */}
+            <RigidBody type="fixed" friction={1.2} restitution={0.05}>
+              <CuboidCollider args={[50000, 50, 50000]} position={[0, -50, 0]} />
+            </RigidBody>
 
-          {params.viewMode === "flight_sim" && (
-            <mesh
-              rotation={[-Math.PI / 2, 0, 0]}
-              position={[0, 0, 0]}
-              args={[2000, 2000]}
-              visible={false}
-              onPointerDown={(e) => {
-                if (!isFlyingPath) {
-                  setWaypoints([...waypoints, e.point]);
-                }
-              }}
-            >
-              <planeGeometry args={[2000, 2000]} />
-              <meshBasicMaterial />
-            </mesh>
-          )}
+            <DroneModel
+              params={params}
+              viewSettings={viewSettings}
+              simSettings={simSettings}
+              groupRef={groupRef}
+              flightTelemetryRef={flightTelemetryRef}
+              waypoints={waypoints}
+              isFlyingPath={isFlyingPath}
+              onFlightComplete={() => setIsFlyingPath(false)}
+              controlSensitivity={controlSensitivity}
+            />
 
-          {waypoints.length > 0 && params.viewMode === "flight_sim" && (
-            <group>
-              {waypoints.length > 1 && (
-                <Line
-                  points={waypoints.map((p) => [
-                    p.x,
-                    Math.max(p.y + 20, 20),
-                    p.z,
-                  ])}
-                  color="#10b981"
-                  lineWidth={3}
-                  dashed={false}
-                />
-              )}
-              {waypoints.map((wp, i) => (
-                <mesh
-                  key={i}
-                  position={[wp.x, Math.max(wp.y + 20, 20), wp.z]}
-                >
-                  <sphereGeometry args={[3, 16, 16]} />
-                  <meshStandardMaterial
-                    color={i === 0 ? "#ffffff" : "#10b981"}
-                  />
-                </mesh>
-              ))}
-            </group>
-          )}
+            {params.viewMode === "flight_sim" && (
+              <mesh
+                rotation={[-Math.PI / 2, 0, 0]}
+                position={[0, 0, 0]}
+                visible={false}
+                onPointerDown={(e) => {
+                  if (!isFlyingPath) {
+                    setWaypoints([...waypoints, e.point]);
+                  }
+                }}
+              >
+                <planeGeometry args={[2000, 2000]} />
+                <meshBasicMaterial />
+              </mesh>
+            )}
+
+            {waypoints.length > 0 && params.viewMode === "flight_sim" && (
+              <group>
+                {waypoints.length > 1 && (
+                  <primitive object={flightPathLine} dispose={null} />
+                )}
+                {waypoints.map((wp, i) => (
+                  <mesh
+                    key={i}
+                    position={[wp.x, Math.max(wp.y + 20, 20), wp.z]}
+                  >
+                    <sphereGeometry args={[3, 16, 16]} />
+                    <meshStandardMaterial
+                      color={i === 0 ? "#ffffff" : "#10b981"}
+                    />
+                  </mesh>
+                ))}
+              </group>
+            )}
+
+          </Physics>
 
           <ContactShadows
             position={[0, -0.1, 0]}
@@ -430,6 +857,7 @@ export default function App() {
             minPolarAngle={0}
             maxPolarAngle={Math.PI / 2 + 0.1}
             target={[0, 10, 0]}
+            maxDistance={50000}
           />
         </Canvas>
       </main>

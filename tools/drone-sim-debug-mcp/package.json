@@ -1,0 +1,15 @@
+{
+  "name": "drone-sim-debug-mcp",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
+  }
+}

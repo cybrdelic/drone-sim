@@ -1,9 +1,190 @@
-import React, { useDeferredValue, useMemo, useRef } from "react";
-import * as THREE from "three";
-import { Evaluator, Brush, ADDITION, SUBTRACTION } from "three-bvh-csg";
 import { Html } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
-import { DroneParams } from "../types";
+import { CuboidCollider, RapierRigidBody, RigidBody } from "@react-three/rapier";
+import React, { useDeferredValue, useMemo, useRef } from "react";
+import * as THREE from "three";
+import { ADDITION, Brush, Evaluator, SUBTRACTION } from "three-bvh-csg";
+import { DroneParams, FlightTelemetry, SimSettings, ViewSettings } from "../types";
+
+function forEachTriangle(
+  geometry: THREE.BufferGeometry,
+  cb: (a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3) => void,
+) {
+  const posAttr = geometry.getAttribute("position");
+  if (!posAttr) return;
+  const indexAttr = geometry.getIndex();
+
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const c = new THREE.Vector3();
+
+  if (indexAttr) {
+    for (let i = 0; i < indexAttr.count; i += 3) {
+      const ia = indexAttr.getX(i);
+      const ib = indexAttr.getX(i + 1);
+      const ic = indexAttr.getX(i + 2);
+
+      a.fromBufferAttribute(posAttr, ia);
+      b.fromBufferAttribute(posAttr, ib);
+      c.fromBufferAttribute(posAttr, ic);
+      cb(a, b, c);
+    }
+    return;
+  }
+
+  for (let i = 0; i < posAttr.count; i += 3) {
+    a.fromBufferAttribute(posAttr, i);
+    b.fromBufferAttribute(posAttr, i + 1);
+    c.fromBufferAttribute(posAttr, i + 2);
+    cb(a, b, c);
+  }
+}
+
+function computePolyMassPropsMm(
+  geometry: THREE.BufferGeometry,
+  densityKgM3: number,
+) {
+  // Computes volume/COM/inertia from a closed triangle mesh by summing signed tetrahedra (0,a,b,c).
+  // Geometry coordinates are assumed to be in millimeters.
+  const mmToM = 1e-3;
+
+  let signedVolumeM3 = 0;
+  const centroidTimesVolM4 = new THREE.Vector3(0, 0, 0);
+
+  let intX2 = 0;
+  let intY2 = 0;
+  let intZ2 = 0;
+  let intXY = 0;
+  let intYZ = 0;
+  let intZX = 0;
+
+  forEachTriangle(geometry, (aMm, bMm, cMm) => {
+    const ax = aMm.x * mmToM;
+    const ay = aMm.y * mmToM;
+    const az = aMm.z * mmToM;
+    const bx = bMm.x * mmToM;
+    const by = bMm.y * mmToM;
+    const bz = bMm.z * mmToM;
+    const cx = cMm.x * mmToM;
+    const cy = cMm.y * mmToM;
+    const cz = cMm.z * mmToM;
+
+    const crossBxCx = by * cz - bz * cy;
+    const crossByCy = bz * cx - bx * cz;
+    const crossBzCz = bx * cy - by * cx;
+    const v6 = ax * crossBxCx + ay * crossByCy + az * crossBzCz;
+    const v = v6 / 6;
+    if (!Number.isFinite(v) || Math.abs(v) < 1e-18) return;
+
+    signedVolumeM3 += v;
+    centroidTimesVolM4.x += (ax + bx + cx) * (v / 4);
+    centroidTimesVolM4.y += (ay + by + cy) * (v / 4);
+    centroidTimesVolM4.z += (az + bz + cz) * (v / 4);
+
+    const f1 = (p: number, q: number, r: number) =>
+      p * p + q * q + r * r + p * q + q * r + r * p;
+    const f2 = (
+      px: number,
+      py: number,
+      qx: number,
+      qy: number,
+      rx: number,
+      ry: number,
+    ) =>
+      2 * (px * py + qx * qy + rx * ry) +
+      (px * qy + py * qx) +
+      (px * ry + py * rx) +
+      (qx * ry + qy * rx);
+
+    intX2 += (v / 10) * f1(ax, bx, cx);
+    intY2 += (v / 10) * f1(ay, by, cy);
+    intZ2 += (v / 10) * f1(az, bz, cz);
+    intXY += (v / 20) * f2(ax, ay, bx, by, cx, cy);
+    intYZ += (v / 20) * f2(ay, az, by, bz, cy, cz);
+    intZX += (v / 20) * f2(az, ax, bz, bx, cz, cx);
+  });
+
+  if (!Number.isFinite(signedVolumeM3) || Math.abs(signedVolumeM3) < 1e-18) {
+    return {
+      signedVolumeMm3: 0,
+      massKg: 0,
+      comMm: new THREE.Vector3(0, 0, 0),
+      inertiaKgM2_aboutCOM: new THREE.Matrix3().set(0, 0, 0, 0, 0, 0, 0, 0, 0),
+    };
+  }
+
+  const sign = signedVolumeM3 < 0 ? -1 : 1;
+  const volumeM3 = Math.abs(signedVolumeM3);
+  const massKg = volumeM3 * densityKgM3;
+  const comM = centroidTimesVolM4.clone().multiplyScalar(1 / signedVolumeM3);
+  const comMm = comM.clone().multiplyScalar(1 / mmToM);
+
+  const Ixx0 = sign * densityKgM3 * (intY2 + intZ2);
+  const Iyy0 = sign * densityKgM3 * (intX2 + intZ2);
+  const Izz0 = sign * densityKgM3 * (intX2 + intY2);
+  const Ixy0 = -sign * densityKgM3 * intXY;
+  const Iyz0 = -sign * densityKgM3 * intYZ;
+  const Ixz0 = -sign * densityKgM3 * intZX;
+
+  const I0 = new THREE.Matrix3().set(
+    Ixx0,
+    Ixy0,
+    Ixz0,
+    Ixy0,
+    Iyy0,
+    Iyz0,
+    Ixz0,
+    Iyz0,
+    Izz0,
+  );
+
+  // Parallel-axis shift: inertia about COM.
+  const r2 = comM.lengthSq();
+  const rrT = new THREE.Matrix3().set(
+    comM.x * comM.x,
+    comM.x * comM.y,
+    comM.x * comM.z,
+    comM.y * comM.x,
+    comM.y * comM.y,
+    comM.y * comM.z,
+    comM.z * comM.x,
+    comM.z * comM.y,
+    comM.z * comM.z,
+  );
+  const I3 = new THREE.Matrix3().identity();
+  const shift = I3.multiplyScalar(r2);
+  {
+    const d = shift.elements;
+    const s = rrT.elements;
+    for (let i = 0; i < 9; i++) d[i] -= s[i];
+  }
+  shift.multiplyScalar(massKg);
+
+  const Icom = I0.clone();
+  {
+    const d = Icom.elements;
+    const s = shift.elements;
+    for (let i = 0; i < 9; i++) d[i] -= s[i];
+  }
+
+  return {
+    signedVolumeMm3: signedVolumeM3 / (mmToM * mmToM * mmToM),
+    massKg,
+    comMm,
+    inertiaKgM2_aboutCOM: Icom,
+  };
+}
+
+function boxInertiaDiagKgM2(massKg: number, sizeM: THREE.Vector3) {
+  const x = sizeM.x;
+  const y = sizeM.y;
+  const z = sizeM.z;
+  return new THREE.Vector3(
+    (1 / 12) * massKg * (y * y + z * z),
+    (1 / 12) * massKg * (x * x + z * z),
+    (1 / 12) * massKg * (x * x + y * y),
+  );
+}
 
 function Annotation({
   title,
@@ -39,19 +220,48 @@ function Annotation({
 
 interface DroneModelProps {
   params: DroneParams;
+  viewSettings?: ViewSettings;
+  simSettings?: SimSettings;
   groupRef: React.RefObject<THREE.Group | null>;
+  flightTelemetryRef?: React.MutableRefObject<FlightTelemetry>;
   waypoints?: THREE.Vector3[];
   isFlyingPath?: boolean;
   onFlightComplete?: () => void;
+  controlSensitivity?: number;
 }
 
 export function DroneModel({
   params,
+  viewSettings,
+  simSettings,
   groupRef,
+  flightTelemetryRef,
   waypoints = [],
   isFlyingPath = false,
   onFlightComplete,
+  controlSensitivity = 0.45,
 }: DroneModelProps) {
+  const effectiveViewSettings: ViewSettings =
+    viewSettings ??
+    ({
+      wireframe: false,
+      focus: "all",
+      visibility: {
+        frame: true,
+        propulsion: true,
+        electronics: true,
+        accessories: true,
+      },
+    } as ViewSettings);
+
+  const effectiveSimSettings: SimSettings =
+    simSettings ??
+    ({
+      motorAudioEnabled: false,
+      motorAudioVolume: 0.35,
+      vibrationAmount: 0.35,
+    } as SimSettings);
+
   const deferredParams = useDeferredValue(params);
 
   const {
@@ -69,6 +279,30 @@ export function DroneModel({
     tpuColor,
     viewMode,
   } = deferredParams;
+
+  const propGroupRefs = useRef<Array<THREE.Group | null>>([]);
+  const propSpinRad = useRef<number[]>([0, 0, 0, 0]);
+  const flightBodyRef = useRef<RapierRigidBody | null>(null);
+  const flightInitDone = useRef(false);
+
+  const visualJitterRef = useRef<THREE.Group | null>(null);
+
+  const audioRef = useRef<{
+    ctx: AudioContext;
+    master: GainNode;
+    motorOsc: OscillatorNode[];
+    motorGain: GainNode[];
+    noiseSrc: AudioBufferSourceNode;
+    noiseGain: GainNode;
+    noiseHp: BiquadFilterNode;
+  } | null>(null);
+
+  const audioTelemetry = useRef({
+    omegaRad: [0, 0, 0, 0] as number[],
+    omegaMaxRad: 1 as number,
+    mechPowerW: 0 as number,
+    thrustTotalN: 0 as number,
+  });
 
   // Materials
   const carbonMaterial = useMemo(
@@ -389,19 +623,57 @@ export function DroneModel({
       evaluator,
     ]);
 
+  const bottomPlateTopY = useMemo(() => {
+    bottomPlateGeo.computeBoundingBox();
+    const bb = bottomPlateGeo.boundingBox;
+    return bb ? bb.max.y : plateThickness;
+  }, [bottomPlateGeo, plateThickness]);
+
+  const bottomPlateMinY = useMemo(() => {
+    bottomPlateGeo.computeBoundingBox();
+    const bb = bottomPlateGeo.boundingBox;
+    return bb ? bb.min.y : -plateThickness;
+  }, [bottomPlateGeo, plateThickness]);
+
+  const topPlateTopY = useMemo(() => {
+    topPlateGeo.computeBoundingBox();
+    const bb = topPlateGeo.boundingBox;
+    return bb ? bb.max.y : topPlateThickness;
+  }, [topPlateGeo, topPlateThickness]);
+
   // Layout Logic based on viewMode
   let bottomPos: [number, number, number] = [0, 0, 0];
   let topPos: [number, number, number] = [
     0,
-    plateThickness + standoffHeight,
+    bottomPlateTopY + standoffHeight,
     0,
   ];
-  let standoffY = plateThickness + standoffHeight / 2;
+  let standoffY = bottomPlateTopY + standoffHeight / 2;
   let showStandoffs = true;
 
+  const exploded = viewMode === "exploded";
+  const explodeMotorY = exploded ? 18 : 0;
+  const explodeStackY = exploded ? 28 : 0;
+  const explodeCameraY = exploded ? 38 : 0;
+  const explodeBatteryY = exploded ? 48 : 0;
+  const explodeTpuY = exploded ? 34 : 0;
+
+  // Physics should be enabled in all modes except exploded + print layout.
+  // Exploded is intentionally non-physical; print layout is a CAD layout view.
+  const physicsEnabled = viewMode !== "exploded" && viewMode !== "print_layout";
+
+  // Coarse single-body collider for assembled/clearance views.
+  const assemblyHalfExtents: [number, number, number] = [
+    frameSize * 0.5,
+    35,
+    frameSize * 0.5,
+  ];
+  const assemblyColliderCenterY = bottomPlateMinY + assemblyHalfExtents[1];
+  const assemblySpawnLiftY = -bottomPlateMinY + 1;
+
   if (viewMode === "exploded") {
-    topPos = [0, plateThickness + standoffHeight + 30, 0];
-    standoffY = plateThickness + standoffHeight / 2 + 15;
+    topPos = [0, bottomPlateTopY + standoffHeight + 30, 0];
+    standoffY = bottomPlateTopY + standoffHeight / 2 + 15;
   } else if (viewMode === "print_layout") {
     bottomPos = [0, 0, 0];
     topPos = [fcMounting + 40, 0, 0]; // Place next to bottom plate
@@ -420,39 +692,440 @@ export function DroneModel({
     e: false,
   });
 
-  const velocity = useRef(new THREE.Vector3());
-  const pathProgress = useRef(0);
-  const curveRef = useRef<THREE.CatmullRomCurve3 | null>(null);
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
   React.useEffect(() => {
-    if (waypoints.length >= 2) {
-      const points = waypoints.map(
-        (p) => new THREE.Vector3(p.x, Math.max(p.y + 20, 20), p.z),
+    // Wireframe toggle for all materials (including inline materials).
+    if (!groupRef.current) return;
+    groupRef.current.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+      if (!material) return;
+      const apply = (m: THREE.Material) => {
+        const anyMat = m as any;
+        if (typeof anyMat.wireframe === "boolean") {
+          anyMat.wireframe = effectiveViewSettings.wireframe;
+          m.needsUpdate = true;
+        }
+      };
+      if (Array.isArray(material)) material.forEach(apply);
+      else apply(material);
+    });
+  }, [groupRef, effectiveViewSettings.wireframe]);
+
+  React.useEffect(() => {
+    // Create/tear down motor audio nodes.
+    if (!effectiveSimSettings.motorAudioEnabled) {
+      if (audioRef.current) {
+        try {
+          audioRef.current.motorOsc.forEach((o) => o.stop());
+          audioRef.current.noiseSrc.stop();
+          audioRef.current.ctx.close();
+        } catch {
+          // ignore
+        }
+        audioRef.current = null;
+      }
+      return;
+    }
+
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    const ctx: AudioContext = new AudioCtx({ latencyHint: "interactive" });
+    void ctx.resume().catch(() => {
+      // Autoplay policies: user interaction is still required.
+    });
+
+    const master = ctx.createGain();
+    master.gain.value = 0.0001;
+    master.connect(ctx.destination);
+
+    const motorOsc: OscillatorNode[] = [];
+    const motorGain: GainNode[] = [];
+    for (let i = 0; i < 4; i++) {
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.value = 60;
+      const g = ctx.createGain();
+      g.gain.value = 0;
+      osc.connect(g);
+      g.connect(master);
+      osc.start();
+      motorOsc.push(osc);
+      motorGain.push(g);
+    }
+
+    // Broadband noise component for "whoosh" / turbulence.
+    const noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const data = noiseBuf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = noiseBuf;
+    noiseSrc.loop = true;
+
+    const noiseHp = ctx.createBiquadFilter();
+    noiseHp.type = "highpass";
+    noiseHp.frequency.value = 400;
+    noiseHp.Q.value = 0.7;
+
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.value = 0;
+
+    noiseSrc.connect(noiseHp);
+    noiseHp.connect(noiseGain);
+    noiseGain.connect(master);
+    noiseSrc.start();
+
+    audioRef.current = { ctx, master, motorOsc, motorGain, noiseSrc, noiseGain, noiseHp };
+
+    return () => {
+      if (!audioRef.current) return;
+      try {
+        audioRef.current.motorOsc.forEach((o) => o.stop());
+        audioRef.current.noiseSrc.stop();
+        audioRef.current.ctx.close();
+      } catch {
+        // ignore
+      }
+      audioRef.current = null;
+    };
+  }, [effectiveSimSettings.motorAudioEnabled]);
+
+  const massProps = useMemo(() => {
+    const mmToM = 1e-3;
+    const carbonDensityKgM3 = 1600;
+
+    // Plate mass properties from the actual generated CAD triangle meshes.
+    const bottomPlate = computePolyMassPropsMm(bottomPlateGeo, carbonDensityKgM3);
+    const topPlate = computePolyMassPropsMm(topPlateGeo, carbonDensityKgM3);
+
+    // Assembled offsets (mm)
+    const bottomOffsetMm = new THREE.Vector3(0, 0, 0);
+    const topOffsetMm = new THREE.Vector3(0, plateThickness + standoffHeight, 0);
+
+    const bottomComMm = bottomPlate.comMm.clone().add(bottomOffsetMm);
+    const topComMm = topPlate.comMm.clone().add(topOffsetMm);
+
+    // Other components as point masses.
+    const motorMassKg = (propSize >= 7 ? 45 : propSize >= 5 ? 32 : 12) / 1000;
+    const batteryMassKg = (propSize >= 7 ? 250 : propSize >= 5 ? 180 : 65) / 1000;
+    const stackMassKg = 18 / 1000;
+    const propMassKg = (propSize * 0.8) / 1000;
+    const miscMassKg = 20 / 1000;
+
+    const motorTotalMassKg = (motorMassKg + propMassKg) * 4;
+
+    const batteryPosMm = new THREE.Vector3(
+      0,
+      topOffsetMm.y + topPlateThickness + 15,
+      0,
+    );
+    const stackPosMm = new THREE.Vector3(0, plateThickness + 10, 0);
+    const motorPosMm = motorPositions.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+
+    const totalMassKg = Math.max(
+      0.05,
+      bottomPlate.massKg +
+        topPlate.massKg +
+        motorTotalMassKg +
+        batteryMassKg +
+        stackMassKg +
+        miscMassKg,
+    );
+
+    // Total COM (mm)
+    const comMm = new THREE.Vector3(0, 0, 0);
+    comMm.add(bottomComMm.clone().multiplyScalar(bottomPlate.massKg));
+    comMm.add(topComMm.clone().multiplyScalar(topPlate.massKg));
+    comMm.add(batteryPosMm.clone().multiplyScalar(batteryMassKg));
+    comMm.add(stackPosMm.clone().multiplyScalar(stackMassKg));
+    for (const mp of motorPosMm) {
+      comMm.add(mp.clone().multiplyScalar(motorMassKg + propMassKg));
+    }
+    comMm.divideScalar(totalMassKg);
+
+    const I3 = new THREE.Matrix3().identity();
+    const addShift = (m: number, rM: THREE.Vector3) => {
+      const r2 = rM.lengthSq();
+      const rrT = new THREE.Matrix3().set(
+        rM.x * rM.x,
+        rM.x * rM.y,
+        rM.x * rM.z,
+        rM.y * rM.x,
+        rM.y * rM.y,
+        rM.y * rM.z,
+        rM.z * rM.x,
+        rM.z * rM.y,
+        rM.z * rM.z,
       );
-      curveRef.current = new THREE.CatmullRomCurve3(points);
-    } else {
-      curveRef.current = null;
+      const out = I3.clone().multiplyScalar(r2);
+      {
+        const d = out.elements;
+        const s = rrT.elements;
+        for (let i = 0; i < 9; i++) d[i] -= s[i];
+      }
+      return out.multiplyScalar(m);
+    };
+
+    const addMat3InPlace = (dst: THREE.Matrix3, src: THREE.Matrix3) => {
+      const d = dst.elements;
+      const s = src.elements;
+      for (let i = 0; i < 9; i++) d[i] += s[i];
+    };
+
+    // Total inertia about total COM
+    const inertiaKgM2 = new THREE.Matrix3().set(0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    // Plates: shift each plate's inertia-about-its-own-COM to total COM.
+    {
+      const shiftB = addShift(
+        bottomPlate.massKg,
+        bottomComMm.clone().sub(comMm).multiplyScalar(mmToM),
+      );
+      const plateB = bottomPlate.inertiaKgM2_aboutCOM.clone();
+      addMat3InPlace(plateB, shiftB);
+      addMat3InPlace(inertiaKgM2, plateB);
+    }
+
+    {
+      const shiftT = addShift(
+        topPlate.massKg,
+        topComMm.clone().sub(comMm).multiplyScalar(mmToM),
+      );
+      const plateT = topPlate.inertiaKgM2_aboutCOM.clone();
+      addMat3InPlace(plateT, shiftT);
+      addMat3InPlace(inertiaKgM2, plateT);
+    }
+
+    // Point masses
+    addMat3InPlace(
+      inertiaKgM2,
+      addShift(
+        batteryMassKg,
+        batteryPosMm.clone().sub(comMm).multiplyScalar(mmToM),
+      ),
+    );
+    addMat3InPlace(
+      inertiaKgM2,
+      addShift(stackMassKg, stackPosMm.clone().sub(comMm).multiplyScalar(mmToM)),
+    );
+    for (const mp of motorPosMm) {
+      addMat3InPlace(
+        inertiaKgM2,
+        addShift(
+          motorMassKg + propMassKg,
+          mp.clone().sub(comMm).multiplyScalar(mmToM),
+        ),
+      );
+    }
+    addMat3InPlace(inertiaKgM2, addShift(miscMassKg, new THREE.Vector3(0, 0, 0)));
+
+    // Clamp diagonal to avoid singularities.
+    inertiaKgM2.elements[0] = Math.max(inertiaKgM2.elements[0], 1e-7);
+    inertiaKgM2.elements[4] = Math.max(inertiaKgM2.elements[4], 1e-7);
+    inertiaKgM2.elements[8] = Math.max(inertiaKgM2.elements[8], 1e-7);
+
+    // Invert once for angular dynamics.
+    const invInertiaKgM2 = inertiaKgM2.clone();
+    const det = invInertiaKgM2.determinant();
+    if (!Number.isFinite(det) || Math.abs(det) < 1e-18) {
+      inertiaKgM2.elements[0] += 1e-6;
+      inertiaKgM2.elements[4] += 1e-6;
+      inertiaKgM2.elements[8] += 1e-6;
+      invInertiaKgM2.copy(inertiaKgM2);
+    }
+    invInertiaKgM2.invert();
+
+    return {
+      massKg: totalMassKg,
+      comMm,
+      inertiaKgM2,
+      invInertiaKgM2,
+    };
+  }, [
+    bottomPlateGeo,
+    motorPositions,
+    plateThickness,
+    propSize,
+    standoffHeight,
+    topPlateGeo,
+    topPlateThickness,
+  ]);
+
+  const flightColliderOffset: [number, number, number] = [
+    -massProps.comMm.x,
+    -massProps.comMm.y,
+    -massProps.comMm.z,
+  ];
+  const flightSpawnLiftY = assemblySpawnLiftY + massProps.comMm.y;
+
+  // Compute the correct collider density so Rapier gets the right total mass.
+  // Volume of the cuboid = 8 * hx * hy * hz (in mm³ since world is mm-scale).
+  const colliderVolumeMm3 =
+    8 * assemblyHalfExtents[0] * assemblyHalfExtents[1] * assemblyHalfExtents[2];
+  const colliderDensity = colliderVolumeMm3 > 0 ? massProps.massKg / colliderVolumeMm3 : 1e-7;
+
+  const propulsion = useMemo(() => {
+    const airDensityKgM3 = 1.225;
+    const diameterM = propSize * 0.0254;
+
+    // Default pitch assumptions by class (edit these if you know your actual prop pitch)
+    const propPitchIn = propSize >= 7 ? 4.0 : propSize >= 5 ? 4.3 : 3.1;
+    const pitchM = propPitchIn * 0.0254;
+    const pitchRatio = diameterM > 1e-6 ? pitchM / diameterM : 0.4;
+
+    // Typical-ish coefficient ranges for small multirotor props.
+    const Ct0 = THREE.MathUtils.clamp(0.08 + 0.08 * (pitchRatio - 0.4), 0.06, 0.16);
+    const Cq0 = THREE.MathUtils.clamp(Ct0 * 0.09, 0.005, 0.03);
+
+    // Default motor KV + battery based on prop class (edit to match your build)
+    const motorKV = propSize >= 7 ? 1300 : propSize >= 5 ? 1950 : 3800;
+    const batteryCells = propSize >= 5 ? 6 : 4;
+    const vOpenPerCell = 3.85;
+    const packRintOhm = propSize >= 5 ? 0.02 : 0.028;
+    const motorEff = 0.85;
+    const motorTauSec = 0.055;
+
+    // Frame flex + tolerances
+    const staticMisalignDeg = 0.6;
+    const flexRadPerN = propSize >= 5 ? 0.00035 : 0.0006;
+    const flexTauSec = 0.08;
+
+    // IMU vib/noise
+    const imuRateNoiseStdRad = 0.03;
+    const vibRateAmpRad = 0.22;
+
+    return {
+      airDensityKgM3,
+      diameterM,
+      propPitchIn,
+      Ct0,
+      Cq0,
+      motorKV,
+      batteryCells,
+      vOpenPerCell,
+      packRintOhm,
+      motorEff,
+      motorTauSec,
+      staticMisalignDeg,
+      flexRadPerN,
+      flexTauSec,
+      imuRateNoiseStdRad,
+      vibRateAmpRad,
+    };
+  }, [propSize]);
+
+  const mulMat3Vec = (m: THREE.Matrix3, v: THREE.Vector3) => {
+    const e = m.elements;
+    return new THREE.Vector3(
+      e[0] * v.x + e[3] * v.y + e[6] * v.z,
+      e[1] * v.x + e[4] * v.y + e[7] * v.z,
+      e[2] * v.x + e[5] * v.y + e[8] * v.z,
+    );
+  };
+
+  const solve4x4 = (A: number[][], b: number[]) => {
+    // Gaussian elimination with partial pivoting. Mutates copies only.
+    const M = A.map((row) => row.slice());
+    const x = b.slice();
+
+    for (let col = 0; col < 4; col++) {
+      let pivot = col;
+      let pivotAbs = Math.abs(M[col][col]);
+      for (let r = col + 1; r < 4; r++) {
+        const v = Math.abs(M[r][col]);
+        if (v > pivotAbs) {
+          pivotAbs = v;
+          pivot = r;
+        }
+      }
+
+      if (pivotAbs < 1e-9) return null;
+
+      if (pivot !== col) {
+        const tmpRow = M[col];
+        M[col] = M[pivot];
+        M[pivot] = tmpRow;
+        const tmpX = x[col];
+        x[col] = x[pivot];
+        x[pivot] = tmpX;
+      }
+
+      const div = M[col][col];
+      for (let c = col; c < 4; c++) M[col][c] /= div;
+      x[col] /= div;
+
+      for (let r = 0; r < 4; r++) {
+        if (r === col) continue;
+        const f = M[r][col];
+        for (let c = col; c < 4; c++) M[r][c] -= f * M[col][c];
+        x[r] -= f * x[col];
+      }
+    }
+
+    return x;
+  };
+
+  const flightState = useRef({
+    posM: new THREE.Vector3(0, 0, 0),
+    velM: new THREE.Vector3(0, 0, 0),
+    quat: new THREE.Quaternion(),
+    omegaBody: new THREE.Vector3(0, 0, 0),
+    motorOmegaRad: [0, 0, 0, 0] as number[],
+    motorTiltRad: [0, 0, 0, 0] as number[],
+    motorPhaseRad: [0, 0, 0, 0] as number[],
+    batteryV: 0 as number,
+    batteryI: 0 as number,
+    throttle01: 0 as number,
+    targetWpIndex: 1 as number,
+    rng: 123456789 as number,
+  });
+
+  React.useEffect(() => {
+    // Reset flight state when leaving flight sim or when a new flight starts.
+    if (viewMode !== "flight_sim") {
+      flightState.current.posM.set(0, 0, 0);
+      flightState.current.velM.set(0, 0, 0);
+      flightState.current.omegaBody.set(0, 0, 0);
+      flightState.current.quat.identity();
+      flightState.current.motorOmegaRad = [0, 0, 0, 0];
+      flightState.current.motorTiltRad = [0, 0, 0, 0];
+      flightState.current.motorPhaseRad = [0, 0, 0, 0];
+      flightState.current.batteryV = propulsion.batteryCells * propulsion.vOpenPerCell;
+      flightState.current.batteryI = 0;
+      flightState.current.throttle01 = 0;
+      flightState.current.targetWpIndex = 1;
+      flightState.current.rng = 123456789;
     }
     if (!isFlyingPath) {
-      pathProgress.current = 0;
-      velocity.current.set(0, 0, 0);
+      flightState.current.targetWpIndex = 1;
     }
-  }, [waypoints, isFlyingPath]);
+  }, [viewMode, isFlyingPath, propulsion]);
 
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
-      if (key === " ") keys.current.space = true;
-      else if (key === "shift") keys.current.shift = true;
-      else if (keys.current.hasOwnProperty(key))
-        (keys.current as any)[key] = true;
+      const code = e.code;
+
+      const isSpace = code === "Space" || key === " " || key === "space" || key === "spacebar";
+      const isShift = code === "ShiftLeft" || code === "ShiftRight" || key === "shift";
+
+      if (isSpace) keys.current.space = true;
+      else if (isShift) keys.current.shift = true;
+      else if (keys.current.hasOwnProperty(key)) (keys.current as any)[key] = true;
     };
     const handleKeyUp = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
-      if (key === " ") keys.current.space = false;
-      else if (key === "shift") keys.current.shift = false;
-      else if (keys.current.hasOwnProperty(key))
-        (keys.current as any)[key] = false;
+      const code = e.code;
+
+      const isSpace = code === "Space" || key === " " || key === "space" || key === "spacebar";
+      const isShift = code === "ShiftLeft" || code === "ShiftRight" || key === "shift";
+
+      if (isSpace) keys.current.space = false;
+      else if (isShift) keys.current.shift = false;
+      else if (keys.current.hasOwnProperty(key)) (keys.current as any)[key] = false;
     };
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
@@ -462,129 +1135,582 @@ export function DroneModel({
     };
   }, []);
 
+  const flightTelemetryTickRef = useRef({ t: 0 });
+
   useFrame((state, delta) => {
     if (!groupRef.current) return;
     const drone = groupRef.current;
 
     if (viewMode === "flight_sim") {
-      if (isFlyingPath && curveRef.current) {
-        const deltaT = Math.min(delta, 0.1);
-        pathProgress.current += deltaT * 0.15;
-        const targetT = Math.min(pathProgress.current + 0.05, 1);
+      const dt = Math.min(delta, 1 / 30);
+      const g = 9.81;
+      const s = flightState.current;
+      const massKg = massProps.massKg;
 
-        if (pathProgress.current >= 1) {
-          if (onFlightComplete) onFlightComplete();
-          return;
+      const body = flightBodyRef.current;
+      if (!body) return;
+
+      if (!flightInitDone.current) {
+        flightInitDone.current = true;
+        body.setTranslation({ x: 0, y: flightSpawnLiftY, z: 0 }, true);
+        body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      }
+
+      // Read state from Rapier (world units are mm).
+      {
+        const t = body.translation();
+        const lv = body.linvel();
+        const av = body.angvel();
+        const r = body.rotation();
+
+        s.posM.set(t.x * 1e-3, t.y * 1e-3, t.z * 1e-3);
+        s.velM.set(lv.x * 1e-3, lv.y * 1e-3, lv.z * 1e-3);
+        s.quat.set(r.x, r.y, r.z, r.w);
+
+        const omegaWorld = new THREE.Vector3(av.x, av.y, av.z);
+        const invQuat = s.quat.clone().invert();
+        s.omegaBody.copy(omegaWorld.applyQuaternion(invQuat));
+      }
+
+      const rho = propulsion.airDensityKgM3;
+      const D = propulsion.diameterM;
+      const Ct0 = propulsion.Ct0;
+      const Cq0 = propulsion.Cq0;
+
+      const Vopen = propulsion.batteryCells * propulsion.vOpenPerCell;
+      if (!s.batteryV || !Number.isFinite(s.batteryV)) s.batteryV = Vopen;
+      const Vpack = Math.max(propulsion.batteryCells * 3.3, Math.min(Vopen, s.batteryV));
+      const omegaMaxRad = (propulsion.motorKV * Vpack) * ((2 * Math.PI) / 60);
+
+      const nMax = omegaMaxRad / (2 * Math.PI);
+      const thrustMaxPerMotorN = Ct0 * rho * nMax * nMax * Math.pow(D, 4);
+      const totalMaxThrustN = thrustMaxPerMotorN * 4;
+
+      // Compute effective vertical thrust efficiency using the same static misalignment + flex model
+      // as the aero loop (small but enough to make hover trim slightly under 1.0 if ignored).
+      const mmToM = 1e-3;
+      const comMm = massProps.comMm;
+      const expectedHoverPerMotorN = (massKg * g) / 4;
+      const up = new THREE.Vector3(0, 1, 0);
+      let verticalEff = 0;
+      for (let i = 0; i < 4; i++) {
+        // Static motor tilt/misalignment
+        const deg = propulsion.staticMisalignDeg;
+        const tiltX = THREE.MathUtils.degToRad(((i < 2 ? -1 : 1) * deg) * 0.35);
+        const tiltZ = THREE.MathUtils.degToRad(((i % 2 === 0 ? -1 : 1) * deg) * 0.45);
+        const staticQuat = new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(tiltX, 0, tiltZ),
+        );
+
+        // Flex tilt around axis derived from arm direction
+        const r = new THREE.Vector3(
+          (motorPositions[i][0] - comMm.x) * mmToM,
+          0,
+          (motorPositions[i][2] - comMm.z) * mmToM,
+        );
+        if (r.lengthSq() < 1e-9) r.set(1, 0, 0);
+        r.normalize();
+        const flexAxis = r.clone().cross(up).normalize();
+        const flexRad = expectedHoverPerMotorN * propulsion.flexRadPerN;
+        const flexQuat = new THREE.Quaternion().setFromAxisAngle(flexAxis, flexRad);
+
+        const tiltQuat = staticQuat.clone().multiply(flexQuat);
+        const axis = up.clone().applyQuaternion(tiltQuat);
+        verticalEff += axis.y;
+      }
+      verticalEff /= 4;
+      verticalEff = THREE.MathUtils.clamp(verticalEff, 0.9, 1);
+
+      // Reaction yaw torque per thrust: Q/T = (Cq/Ct)*D
+      const yawCoeffNmPerN = (Cq0 / Math.max(1e-6, Ct0)) * D;
+      const yawSign = [1, -1, 1, -1];
+
+      // --- Control inputs (manual or waypoint autopilot) ---
+      let throttleCmd01: number;
+      let desiredRateBody = new THREE.Vector3(0, 0, 0); // x=pitch, y=yaw, z=roll
+
+      const hoverThrottle01 = Math.sqrt(
+        Math.min(
+          1,
+          (massKg * g) / Math.max(1e-6, totalMaxThrustN * verticalEff),
+        ),
+      );
+
+      if (isFlyingPath && waypoints.length >= 2) {
+        const idx = Math.min(
+          Math.max(1, s.targetWpIndex),
+          waypoints.length - 1,
+        );
+        const wp = waypoints[idx];
+        const targetM = new THREE.Vector3(
+          wp.x / 1000,
+          Math.max((wp.y + 20) / 1000, 0.02),
+          wp.z / 1000,
+        );
+
+        const toTarget = targetM.clone().sub(s.posM);
+        const dist = toTarget.length();
+
+        if (dist < 0.15) {
+          if (idx >= waypoints.length - 1) {
+            if (onFlightComplete) onFlightComplete();
+          } else {
+            s.targetWpIndex = idx + 1;
+          }
         }
 
-        const targetPos = curveRef.current.getPointAt(targetT);
-        const currentPos = drone.position.clone();
+        const maxSpeed = 4.0;
+        const desiredVel = dist > 1e-6
+          ? toTarget.clone().normalize().multiplyScalar(Math.min(maxSpeed, dist * 2.0))
+          : new THREE.Vector3();
 
-        const dir = targetPos.clone().sub(currentPos);
-        const dist = dir.length();
-        if (dist > 0) dir.normalize();
+        const kpVel = 2.2;
+        const desiredAccel = desiredVel.sub(s.velM).multiplyScalar(kpVel);
 
-        const maxSpeed = 200;
-        const desiredVelocity = dir.multiplyScalar(
-          Math.min(maxSpeed, dist * 10),
+        // Thrust command in world coordinates (N)
+        const gravityVec = new THREE.Vector3(0, -g, 0);
+        const thrustCmdWorldN = desiredAccel.clone().sub(gravityVec).multiplyScalar(massKg);
+        const thrustMagN = Math.min(totalMaxThrustN * 0.95, Math.max(0, thrustCmdWorldN.length()));
+
+        // Convert thrust magnitude to throttle (thrust ~ throttle^2)
+        throttleCmd01 = clamp01(
+          Math.sqrt(
+            thrustMagN / Math.max(1e-6, totalMaxThrustN * verticalEff),
+          ),
         );
 
-        const steer = desiredVelocity.clone().sub(velocity.current);
-        const maxForce = 400;
-        if (steer.length() > maxForce) steer.setLength(maxForce);
+        // Desired attitude: body-up aligns with thrust direction, yaw aligns with velocity direction
+        const desiredUpWorld = thrustCmdWorldN.lengthSq() > 1e-8
+          ? thrustCmdWorldN.clone().normalize()
+          : new THREE.Vector3(0, 1, 0);
 
-        const dragCoeff = 0.03;
-        const drag = velocity.current
-          .clone()
-          .multiplyScalar(-dragCoeff * velocity.current.length());
+        const vFlat = s.velM.clone();
+        vFlat.y = 0;
+        const yawTarget = vFlat.lengthSq() > 1e-6
+          ? Math.atan2(vFlat.x, vFlat.z)
+          : 0;
+        const desiredForward = new THREE.Vector3(Math.sin(yawTarget), 0, Math.cos(yawTarget)).multiplyScalar(-1);
+        const desiredRight = desiredForward.clone().cross(desiredUpWorld).normalize();
+        const desiredForwardOrtho = desiredUpWorld.clone().cross(desiredRight).normalize();
 
-        const acceleration = steer.add(drag);
-        velocity.current.add(acceleration.multiplyScalar(deltaT));
-        drone.position.add(velocity.current.clone().multiplyScalar(deltaT));
+        const desiredMat = new THREE.Matrix4().makeBasis(
+          desiredRight,
+          desiredUpWorld,
+          desiredForwardOrtho,
+        );
+        const desiredQuat = new THREE.Quaternion().setFromRotationMatrix(desiredMat);
 
-        if (velocity.current.lengthSq() > 1) {
-          const targetYaw = Math.atan2(velocity.current.x, velocity.current.z);
-          let diff = targetYaw - drone.rotation.y;
-          while (diff < -Math.PI) diff += Math.PI * 2;
-          while (diff > Math.PI) diff -= Math.PI * 2;
-          drone.rotation.y += diff * deltaT * 5;
+        // Attitude error in body frame
+        const qInv = s.quat.clone().invert();
+        const qErr = desiredQuat.clone().multiply(qInv);
+        if (qErr.w < 0) {
+          qErr.x = -qErr.x;
+          qErr.y = -qErr.y;
+          qErr.z = -qErr.z;
+          qErr.w = -qErr.w;
         }
 
-        const localAccel = acceleration
-          .clone()
-          .applyAxisAngle(new THREE.Vector3(0, 1, 0), -drone.rotation.y);
-        const targetPitch = Math.max(
-          -Math.PI / 3,
-          Math.min(Math.PI / 3, localAccel.z * 0.005),
-        );
-        const targetRoll = Math.max(
-          -Math.PI / 3,
-          Math.min(Math.PI / 3, -localAccel.x * 0.005),
-        );
+        const angle = 2 * Math.acos(Math.max(-1, Math.min(1, qErr.w)));
+        const sinHalf = Math.sqrt(1 - qErr.w * qErr.w);
+        const axisWorld = sinHalf < 1e-6
+          ? new THREE.Vector3(0, 0, 0)
+          : new THREE.Vector3(qErr.x, qErr.y, qErr.z).divideScalar(sinHalf);
+        const axisBody = axisWorld.clone().applyQuaternion(qInv);
 
-        drone.rotation.x = THREE.MathUtils.lerp(
-          drone.rotation.x,
-          targetPitch,
-          deltaT * 8,
-        );
-        drone.rotation.z = THREE.MathUtils.lerp(
-          drone.rotation.z,
-          targetRoll,
-          deltaT * 8,
-        );
+        const attErrBody = axisBody.multiplyScalar(angle);
+        const kpAtt = 10.0;
+        const kdAtt = 2.5;
+        desiredRateBody = attErrBody.multiplyScalar(kpAtt).add(s.omegaBody.clone().multiplyScalar(-kdAtt));
+
+        // Convert desiredRateBody into a bounded rate command
+        const maxRate = 4.0;
+        if (desiredRateBody.length() > maxRate) desiredRateBody.setLength(maxRate);
       } else {
-        const speed = 150 * delta;
-        const rotSpeed = 2.5 * delta;
+        // Manual: throttle around hover + stick input
+        const sens = THREE.MathUtils.clamp(controlSensitivity, 0.2, 1);
+        const throttleDelta = (keys.current.space ? 1 : 0) - (keys.current.shift ? 1 : 0);
+        const targetThrottle = hoverThrottle01 + throttleDelta * (0.18 * sens);
+        throttleCmd01 = clamp01(targetThrottle);
 
-        // Kinematics
-        if (keys.current.w) drone.translateZ(-speed);
-        if (keys.current.s) drone.translateZ(speed);
-        if (keys.current.a) drone.translateX(-speed);
-        if (keys.current.d) drone.translateX(speed);
-        if (keys.current.space) drone.translateY(speed);
-        if (keys.current.shift) drone.translateY(-speed);
-        if (keys.current.q) drone.rotateY(rotSpeed);
-        if (keys.current.e) drone.rotateY(-rotSpeed);
+        const pitchCmd = (keys.current.s ? 1 : 0) - (keys.current.w ? 1 : 0);
+        const rollCmd = (keys.current.a ? 1 : 0) - (keys.current.d ? 1 : 0);
+        const yawCmd = (keys.current.q ? 1 : 0) - (keys.current.e ? 1 : 0);
 
-        // Tilt based on movement
-        const targetPitch =
-          (keys.current.w ? -0.4 : 0) + (keys.current.s ? 0.4 : 0);
-        const targetRoll =
-          (keys.current.a ? 0.4 : 0) + (keys.current.d ? -0.4 : 0);
-
-        drone.rotation.x = THREE.MathUtils.lerp(
-          drone.rotation.x,
-          targetPitch,
-          0.1,
+        const maxPitchRate = 2.2 * sens;
+        const maxRollRate = 2.6 * sens;
+        const maxYawRate = 2.2 * sens;
+        desiredRateBody.set(
+          pitchCmd * maxPitchRate,
+          yawCmd * maxYawRate,
+          rollCmd * maxRollRate,
         );
-        drone.rotation.z = THREE.MathUtils.lerp(
-          drone.rotation.z,
-          targetRoll,
-          0.1,
+      }
+
+      // Smooth throttle (motor spool)
+      {
+        const tau = 0.12;
+        const a = 1 - Math.exp(-dt / tau);
+        s.throttle01 = THREE.MathUtils.lerp(s.throttle01, throttleCmd01, a);
+      }
+
+      // Motor positions relative to COM (body), including deterministic tolerance offsets.
+      const tolMm = 0.05;
+      // comMm already defined above
+
+      const rBody = motorPositions.map((p, i) => {
+        const tx = (i % 2 === 0 ? -1 : 1) * tolMm;
+        const tz = (i < 2 ? -1 : 1) * tolMm;
+        return new THREE.Vector3(
+          (p[0] + tx - comMm.x) * mmToM,
+          (p[1] - comMm.y) * mmToM,
+          (p[2] + tz - comMm.z) * mmToM,
+        );
+      });
+
+      // --- IMU (measured angular velocity) with vibration + noise ---
+      const rand01 = () => {
+        s.rng = (1664525 * s.rng + 1013904223) >>> 0;
+        return s.rng / 4294967296;
+      };
+      const randN = (std: number) => {
+        // 4-sample Irwin-Hall approx; std normalization ~= 0.57735
+        const u = rand01() + rand01() + rand01() + rand01();
+        return ((u - 2) / 0.577350269) * std;
+      };
+
+      const omegaMeas = s.omegaBody.clone();
+      omegaMeas.x += randN(propulsion.imuRateNoiseStdRad);
+      omegaMeas.y += randN(propulsion.imuRateNoiseStdRad);
+      omegaMeas.z += randN(propulsion.imuRateNoiseStdRad);
+
+      // Motor-frequency vibration injected into IMU rates (uses last-step motor omega/phase)
+      {
+        const up = new THREE.Vector3(0, 1, 0);
+        for (let i = 0; i < 4; i++) {
+          const omega = Math.max(0, s.motorOmegaRad[i] ?? 0);
+          const vib = Math.sin((s.motorPhaseRad[i] ?? 0) * 3);
+          const vibAmp = propulsion.vibRateAmpRad * (omegaMaxRad > 1e-6 ? omega / omegaMaxRad : 0);
+
+          const armDir = rBody[i].clone();
+          armDir.y = 0;
+          if (armDir.lengthSq() < 1e-9) armDir.set(1, 0, 0);
+          armDir.normalize();
+          const vibAxis = armDir.clone().cross(up).normalize();
+          omegaMeas.add(vibAxis.multiplyScalar(vib * vibAmp));
+        }
+      }
+
+      // --- Rate controller (body) using full inertia tensor ---
+      const kpRate = 6.0;
+      const rateErr = desiredRateBody.clone().sub(omegaMeas);
+      const alphaCmd = rateErr.multiplyScalar(kpRate);
+
+      const Iomega = mulMat3Vec(massProps.inertiaKgM2, s.omegaBody);
+      const gyro = s.omegaBody.clone().cross(Iomega);
+      const torqueCmdBodyNm = mulMat3Vec(massProps.inertiaKgM2, alphaCmd).add(gyro);
+
+      // Desired total thrust (N)
+      const thrustCmdN = clamp01(s.throttle01) ** 2 * totalMaxThrustN;
+
+      // Mixer: solve linear system for per-motor thrusts.
+      // Σf = T
+      // Σ(-z_i f_i) = τx
+      // Σ(x_i f_i) = τz
+      // yawCoeff * Σ(sign_i f_i) = τy
+      const A = [
+        [1, 1, 1, 1],
+        [-rBody[0].z, -rBody[1].z, -rBody[2].z, -rBody[3].z],
+        [rBody[0].x, rBody[1].x, rBody[2].x, rBody[3].x],
+        [
+          yawCoeffNmPerN * yawSign[0],
+          yawCoeffNmPerN * yawSign[1],
+          yawCoeffNmPerN * yawSign[2],
+          yawCoeffNmPerN * yawSign[3],
+        ],
+      ];
+      const b = [thrustCmdN, torqueCmdBodyNm.x, torqueCmdBodyNm.z, torqueCmdBodyNm.y];
+
+      const mix = solve4x4(A, b);
+      const fTargetN = mix ?? [thrustCmdN / 4, thrustCmdN / 4, thrustCmdN / 4, thrustCmdN / 4];
+
+      for (let i = 0; i < 4; i++) {
+        fTargetN[i] = Math.max(0, Math.min(thrustMaxPerMotorN, fTargetN[i]));
+      }
+
+      // Convert thrust targets to omega targets (assume Ct0 for command inversion)
+      const motorA = 1 - Math.exp(-dt / propulsion.motorTauSec);
+      for (let i = 0; i < 4; i++) {
+        const f = fTargetN[i];
+        const omegaTarget =
+          f > 0
+            ? 2 * Math.PI * Math.sqrt(f / Math.max(1e-9, Ct0 * rho * Math.pow(D, 4)))
+            : 0;
+        const omegaClamped = Math.max(0, Math.min(omegaTarget, omegaMaxRad));
+        s.motorOmegaRad[i] = THREE.MathUtils.lerp(s.motorOmegaRad[i] ?? 0, omegaClamped, motorA);
+      }
+
+      // Aerodynamics: thrust/torque from omega and advance ratio, plus frame flex + static motor misalignment.
+      const vBody = s.velM.clone().applyQuaternion(s.quat.clone().invert());
+
+      const Fbody = new THREE.Vector3(0, 0, 0);
+      const torqueBodyNm = new THREE.Vector3(0, 0, 0);
+      let mechPowerW = 0;
+
+      const tmpAxis = new THREE.Vector3();
+      const tmpF = new THREE.Vector3();
+      const tmpTau = new THREE.Vector3();
+
+      const aFlex = 1 - Math.exp(-dt / propulsion.flexTauSec);
+      for (let i = 0; i < 4; i++) {
+        const omega = Math.max(0, s.motorOmegaRad[i] ?? 0);
+        const n = omega / (2 * Math.PI);
+
+        // Flex target derived from commanded thrust (keeps it causal but stable)
+        const flexTarget = fTargetN[i] * propulsion.flexRadPerN;
+        s.motorTiltRad[i] = THREE.MathUtils.lerp(s.motorTiltRad[i] ?? 0, flexTarget, aFlex);
+
+        // Static motor tilt/misalignment (print/assembly realism)
+        const deg = propulsion.staticMisalignDeg;
+        const tiltX = THREE.MathUtils.degToRad(((i < 2 ? -1 : 1) * deg) * 0.35);
+        const tiltZ = THREE.MathUtils.degToRad(((i % 2 === 0 ? -1 : 1) * deg) * 0.45);
+        const staticQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(tiltX, 0, tiltZ));
+
+        // Flex tilt axis based on arm direction
+        const armDir = rBody[i].clone();
+        armDir.y = 0;
+        if (armDir.lengthSq() < 1e-9) armDir.set(1, 0, 0);
+        armDir.normalize();
+        const flexAxis = armDir.clone().cross(up).normalize();
+        const flexQuat = new THREE.Quaternion().setFromAxisAngle(
+          flexAxis,
+          s.motorTiltRad[i] ?? 0,
         );
 
-        // Floor collision
-        if (drone.position.y < 0) drone.position.y = 0;
+        const tiltQuat = staticQuat.multiply(flexQuat);
+        tmpAxis.copy(up).applyQuaternion(tiltQuat).normalize();
+
+        // Advance ratio along the actual thrust axis
+        const vIn = Math.max(0, -vBody.dot(tmpAxis));
+        const J = n > 1e-6 && D > 1e-6 ? vIn / (n * D) : 0;
+        const Ct = Ct0 * THREE.MathUtils.clamp(1 - 0.6 * J, 0, 1.25);
+        const Cq = Cq0 * THREE.MathUtils.clamp(1 - 0.5 * J, 0, 1.25);
+
+        const thrustN = Ct * rho * n * n * Math.pow(D, 4);
+        const torqueNm = Cq * rho * n * n * Math.pow(D, 5);
+        mechPowerW += torqueNm * omega;
+
+        tmpF.copy(tmpAxis).multiplyScalar(thrustN);
+        Fbody.add(tmpF);
+
+        tmpTau.copy(rBody[i]).cross(tmpF);
+        torqueBodyNm.add(tmpTau);
+        torqueBodyNm.y += yawSign[i] * torqueNm;
+
+        // Advance motor phase for next step (drives IMU vibration)
+        s.motorPhaseRad[i] = ((s.motorPhaseRad[i] ?? 0) + omega * dt) % (Math.PI * 2);
+      }
+
+      // Export audio telemetry (physics-driven).
+      audioTelemetry.current.omegaRad = [
+        s.motorOmegaRad[0] ?? 0,
+        s.motorOmegaRad[1] ?? 0,
+        s.motorOmegaRad[2] ?? 0,
+        s.motorOmegaRad[3] ?? 0,
+      ];
+      audioTelemetry.current.omegaMaxRad = omegaMaxRad;
+      audioTelemetry.current.mechPowerW = mechPowerW;
+      audioTelemetry.current.thrustTotalN = Math.max(0, Fbody.y);
+
+      // Net force in world (gravity is handled by Rapier).
+      const thrustWorld = Fbody.clone().applyQuaternion(s.quat);
+
+      // Quadratic drag (rough)
+      const CdA = (frameSize / 210) * 0.012;
+      const v = s.velM;
+      const speed = v.length();
+      const dragWorld = speed > 1e-6
+        ? v.clone().multiplyScalar(-0.5 * rho * CdA * speed)
+        : new THREE.Vector3(0, 0, 0);
+
+      // Apply forces/torques to Rapier.
+      // Rapier world uses mm, so: 1 N -> 1000 (kg*mm/s^2), 1 N*m -> 1e6 (kg*mm^2/s^2)
+      {
+        const forceWorldN = thrustWorld.add(dragWorld);
+        const torqueWorldNm = torqueBodyNm.clone().applyQuaternion(s.quat);
+
+        body.resetForces(true);
+        body.resetTorques(true);
+        body.addForce(
+          {
+            x: forceWorldN.x * 1000,
+            y: forceWorldN.y * 1000,
+            z: forceWorldN.z * 1000,
+          },
+          true,
+        );
+        body.addTorque(
+          {
+            x: torqueWorldNm.x * 1e6,
+            y: torqueWorldNm.y * 1e6,
+            z: torqueWorldNm.z * 1e6,
+          },
+          true,
+        );
+      }
+
+      // Publish flight telemetry for UI (no DevTools required).
+      if (flightTelemetryRef) {
+        flightTelemetryTickRef.current.t += dt;
+        if (flightTelemetryTickRef.current.t >= 0.05) {
+          flightTelemetryTickRef.current.t = 0;
+          const weightN = massKg * g;
+          const thrustN = Math.max(0, thrustWorld.y);
+          const tw = weightN > 1e-6 ? thrustN / weightN : 0;
+          flightTelemetryRef.current = {
+            throttle01: s.throttle01,
+            thrustN,
+            weightN,
+            tw,
+            altitudeM: s.posM.y,
+            speedMS: s.velM.length(),
+          };
+        }
+      }
+
+      // Battery sag (very simplified but causal): V = Voc - I*R, I from mechanical power/eff.
+      {
+        const Pel = mechPowerW / Math.max(0.2, propulsion.motorEff);
+        let V = Vpack;
+        let I = 0;
+        for (let k = 0; k < 2; k++) {
+          I = Pel / Math.max(1, V);
+          V = Math.max(
+            propulsion.batteryCells * 3.3,
+            Math.min(Vopen, Vopen - I * propulsion.packRintOhm),
+          );
+        }
+        s.batteryV = V;
+        s.batteryI = I;
+      }
+
+      // Visual: spin propellers based on motor angular velocity
+      for (let i = 0; i < 4; i++) {
+        const propGroup = propGroupRefs.current[i];
+        if (!propGroup) continue;
+        const isCW = i === 0 || i === 2;
+        const dir = isCW ? 1 : -1;
+        const omega = Math.max(0, s.motorOmegaRad[i] ?? 0);
+        propSpinRad.current[i] = (propSpinRad.current[i] + dir * omega * dt) % (Math.PI * 2);
+        propGroup.rotation.y = propSpinRad.current[i];
+      }
+
+      // Procedural vibration (visual-only): derived from motor phase + omega.
+      if (visualJitterRef.current) {
+        const vib = clamp01(effectiveSimSettings.vibrationAmount);
+        const o0 = Math.max(0, s.motorOmegaRad[0] ?? 0);
+        const o1 = Math.max(0, s.motorOmegaRad[1] ?? 0);
+        const o2 = Math.max(0, s.motorOmegaRad[2] ?? 0);
+        const o3 = Math.max(0, s.motorOmegaRad[3] ?? 0);
+        const oAvg = (o0 + o1 + o2 + o3) * 0.25;
+        const oNorm = omegaMaxRad > 1e-6 ? clamp01(oAvg / omegaMaxRad) : 0;
+
+        const ph0 = s.motorPhaseRad[0] ?? 0;
+        const ph1 = s.motorPhaseRad[1] ?? 0;
+        const ph2 = s.motorPhaseRad[2] ?? 0;
+        const ph3 = s.motorPhaseRad[3] ?? 0;
+
+        const ax = (Math.sin(ph0) - Math.sin(ph1) + Math.sin(ph2) - Math.sin(ph3)) * 0.25;
+        const az = (Math.cos(ph0) + Math.cos(ph1) - Math.cos(ph2) - Math.cos(ph3)) * 0.25;
+
+        // mm translation jitter + small roll/pitch shake.
+        const tMm = 0.35 * vib * oNorm;
+        visualJitterRef.current.position.set(ax * tMm, 0, az * tMm);
+        const rRad = 0.012 * vib * oNorm;
+        visualJitterRef.current.rotation.set(az * rRad, 0, -ax * rRad);
       }
     } else {
-      // Reset position and rotation when not in flight sim
-      drone.position.lerp(new THREE.Vector3(0, 0, 0), 0.1);
-      drone.rotation.x = THREE.MathUtils.lerp(drone.rotation.x, 0, 0.1);
-      drone.rotation.y = THREE.MathUtils.lerp(drone.rotation.y, 0, 0.1);
-      drone.rotation.z = THREE.MathUtils.lerp(drone.rotation.z, 0, 0.1);
+      flightInitDone.current = false;
+      if (visualJitterRef.current) {
+        visualJitterRef.current.position.set(0, 0, 0);
+        visualJitterRef.current.rotation.set(0, 0, 0);
+      }
+      // Non-flight modes: don't kinematically override transforms (Rapier may be driving bodies).
+      // Idle: stop prop spin visuals
+      for (let i = 0; i < 4; i++) {
+        const propGroup = propGroupRefs.current[i];
+        if (!propGroup) continue;
+        propGroup.rotation.y = 0;
+        propSpinRad.current[i] = 0;
+      }
+    }
+
+    // Audio update (runs in all modes; audible only when enabled).
+    if (audioRef.current) {
+      const nodes = audioRef.current;
+      const tel = audioTelemetry.current;
+
+      const enabled = effectiveSimSettings.motorAudioEnabled && viewMode === "flight_sim";
+      const masterTarget = enabled ? clamp01(effectiveSimSettings.motorAudioVolume) : 0;
+      nodes.master.gain.setTargetAtTime(Math.max(0.0001, masterTarget), nodes.ctx.currentTime, 0.02);
+
+      const blades = 3;
+      const omegaMax = Math.max(1e-3, tel.omegaMaxRad);
+      for (let i = 0; i < 4; i++) {
+        const omega = Math.max(0, tel.omegaRad[i] ?? 0);
+        const rps = omega / (2 * Math.PI);
+        const bpf = Math.max(0, rps * blades);
+        nodes.motorOsc[i].frequency.setTargetAtTime(bpf, nodes.ctx.currentTime, 0.015);
+
+        const oNorm = clamp01(omega / omegaMax);
+        const gain = enabled ? 0.08 * Math.pow(oNorm, 1.3) : 0;
+        nodes.motorGain[i].gain.setTargetAtTime(gain, nodes.ctx.currentTime, 0.02);
+      }
+
+      const powerNorm = clamp01(Math.sqrt(Math.max(0, tel.mechPowerW)) / 80);
+      const noiseGain = enabled ? 0.05 * powerNorm : 0;
+      nodes.noiseGain.gain.setTargetAtTime(noiseGain, nodes.ctx.currentTime, 0.03);
     }
   });
 
-  return (
-    <group ref={groupRef}>
+  const v = effectiveViewSettings.visibility;
+  const droneVisual = (
+    <group
+      ref={groupRef}
+      position={
+        viewMode === "flight_sim"
+          ? [-massProps.comMm.x, -massProps.comMm.y, -massProps.comMm.z]
+          : [0, 0, 0]
+      }
+    >
+      <group ref={visualJitterRef}>
+      {(viewMode === "exploded" || viewMode === "flight_sim") && (
+        <group position={[0, bottomPlateTopY + 2, 0]}>
+          <axesHelper args={[90]} />
+          {/* Forward marker: points toward +Z in model space */}
+          <group position={[0, 0, fcMounting / 2 + 40]}>
+            <mesh rotation={[Math.PI / 2, 0, 0]}>
+              <coneGeometry args={[4, 14, 10]} />
+              <meshStandardMaterial
+                color="#eab308"
+                metalness={0.1}
+                roughness={0.4}
+              />
+            </mesh>
+          </group>
+        </group>
+      )}
       {/* Bottom Plate */}
-      <mesh
-        geometry={bottomPlateGeo}
-        position={bottomPos}
-        castShadow
-        receiveShadow
-        material={carbonMaterial}
-      />
+      {v.frame && (
+        <mesh
+          geometry={bottomPlateGeo}
+          position={bottomPos}
+          castShadow
+          receiveShadow
+          material={carbonMaterial}
+        />
+      )}
       {viewMode === "exploded" && (
         <Annotation
           title="Unibody Bottom Plate"
@@ -594,13 +1720,15 @@ export function DroneModel({
       )}
 
       {/* Top Plate */}
-      <mesh
-        geometry={topPlateGeo}
-        position={topPos}
-        castShadow
-        receiveShadow
-        material={carbonMaterial}
-      />
+      {v.frame && (
+        <mesh
+          geometry={topPlateGeo}
+          position={topPos}
+          castShadow
+          receiveShadow
+          material={carbonMaterial}
+        />
+      )}
       {viewMode === "exploded" && (
         <Annotation
           title="Top Plate"
@@ -610,7 +1738,7 @@ export function DroneModel({
       )}
 
       {/* Standoffs */}
-      {showStandoffs &&
+      {v.frame && showStandoffs &&
         standoffsData.map((pos, i) => (
           <mesh
             key={i}
@@ -633,7 +1761,7 @@ export function DroneModel({
       {/* Rigorous Clearance & Payload Visualization (Visible in all modes) */}
       <group>
         {/* Motors & Propellers */}
-        {motorPositions.map((pos, i) => {
+        {v.propulsion && motorPositions.map((pos, i) => {
           const isCW = i === 0 || i === 2; // Standard Betaflight motor direction
           const motorRadius =
             motorMountPattern >= 16
@@ -645,20 +1773,39 @@ export function DroneModel({
             motorMountPattern >= 16 ? 15 : motorMountPattern >= 12 ? 10 : 8;
           const propR = (propSize * 25.4) / 2;
 
+          const armLen = Math.max(1e-6, Math.hypot(pos[0], pos[2]));
+          const armDirX = pos[0] / armLen;
+          const armDirZ = pos[2] / armLen;
+          const explodeMotorRad = exploded ? 22 : 0;
+          const explodeMotorX = armDirX * explodeMotorRad;
+          const explodeMotorZ = armDirZ * explodeMotorRad;
+
           return (
             <group
               key={`motor-prop-${i}`}
-              position={[pos[0] + bottomPos[0], bottomPos[1], pos[2] + bottomPos[2]]}
+              position={[
+                pos[0] + bottomPos[0] + explodeMotorX,
+                bottomPos[1] + bottomPlateTopY + explodeMotorY,
+                pos[2] + bottomPos[2] + explodeMotorZ,
+              ]}
             >
+              <group>
+                {exploded && i === 0 && (
+                  <Annotation
+                    title="Motors + Props"
+                    description={`${motorMountPattern}x${motorMountPattern}mm mount • ${propSize.toFixed(1)}in props`}
+                    position={[motorRadius + 20, motorHeight + 18, 0]}
+                  />
+                )}
                 {/* Motor Stator/Base */}
-                <mesh position={[0, motorHeight * 0.2, 0]}>
+                <mesh position={[0, motorHeight * 0.2, 0]} castShadow receiveShadow>
                   <cylinderGeometry
                     args={[motorRadius, motorRadius, motorHeight * 0.4, 32]}
                   />
-                  <meshStandardMaterial color="#333" roughness={0.8} />
+                  <meshStandardMaterial color="#404040" roughness={0.6} metalness={0.2} />
                 </mesh>
                 {/* Motor Bell */}
-                <mesh position={[0, motorHeight * 0.75, 0]}>
+                <mesh position={[0, motorHeight * 0.75, 0]} castShadow receiveShadow>
                   <cylinderGeometry
                     args={[
                       motorRadius * 0.95,
@@ -668,23 +1815,34 @@ export function DroneModel({
                     ]}
                   />
                   <meshStandardMaterial
-                    color="#111"
-                    metalness={0.8}
-                    roughness={0.2}
+                    color="#1f2937"
+                    metalness={0.9}
+                    roughness={0.15}
                   />
                 </mesh>
                 {/* Motor Shaft */}
-                <mesh position={[0, motorHeight + 3, 0]}>
-                  <cylinderGeometry args={[2.5, 2.5, 6, 16]} />
+                <mesh position={[0, motorHeight + 8, 0]} castShadow receiveShadow>
+                  <cylinderGeometry args={[2.2, 2.2, 16, 18]} />
                   <meshStandardMaterial
-                    color="#ccc"
+                    color="#e5e7eb"
                     metalness={1}
-                    roughness={0}
+                    roughness={0.1}
                   />
                 </mesh>
 
+                {/* Axle / shaft extension through prop hub (visual aid) */}
+                <mesh position={[0, motorHeight + 3, 0]} castShadow receiveShadow>
+                  <cylinderGeometry args={[1.1, 1.1, 20, 12]} />
+                  <meshStandardMaterial color="#f8fafc" metalness={1} roughness={0.15} />
+                </mesh>
+
                 {/* Propeller */}
-                <group position={[0, motorHeight + 3, 0]}>
+                <group
+                  position={[0, motorHeight + 3, 0]}
+                  ref={(el) => {
+                    propGroupRefs.current[i] = el;
+                  }}
+                >
                   {/* Hub */}
                   <mesh>
                     <cylinderGeometry args={[6.5, 6.5, 7, 32]} />
@@ -694,7 +1852,7 @@ export function DroneModel({
                   </mesh>
                   {/* Blades */}
                   {[0, 1, 2].map((b) => (
-                    <mesh key={b} rotation={[0, (b * Math.PI * 2) / 3, 0]}>
+                    <group key={b} rotation={[0, (b * Math.PI * 2) / 3, 0]}>
                       <group
                         position={[0, 0, 0]}
                         rotation={[isCW ? 0.3 : -0.3, 0, 0]}
@@ -707,7 +1865,7 @@ export function DroneModel({
                           />
                         </mesh>
                       </group>
-                    </mesh>
+                    </group>
                   ))}
                   {/* Swept Volume Disk */}
                   <mesh rotation={[0, 0, 0]}>
@@ -722,11 +1880,19 @@ export function DroneModel({
                   </mesh>
                 </group>
               </group>
-            );
+            </group>
+          );
           })}
 
           {/* FC Stack (Rigorous) */}
-          <group position={[bottomPos[0], bottomPos[1] + plateThickness, bottomPos[2]]}>
+          {v.electronics && (
+          <group
+            position={[
+              bottomPos[0],
+              bottomPos[1] + bottomPlateTopY + explodeStackY,
+              bottomPos[2],
+            ]}
+          >
             {/* ESC */}
             <mesh position={[0, 4, 0]}>
               <boxGeometry args={[fcMounting + 6, 4, fcMounting + 8]} />
@@ -757,12 +1923,14 @@ export function DroneModel({
               position={[fcMounting / 2 + 10, 12, 0]}
             />
           </group>
+          )}
 
           {/* FPV Camera (Micro 19x19) */}
+          {v.electronics && (
           <group
             position={[
               bottomPos[0],
-              bottomPos[1] + plateThickness + standoffHeight / 2,
+              bottomPos[1] + bottomPlateTopY + standoffHeight / 2 + explodeCameraY,
               bottomPos[2] + fcMounting / 2 + 25,
             ]}
           >
@@ -790,12 +1958,14 @@ export function DroneModel({
               position={[15, 0, 0]}
             />
           </group>
+          )}
 
           {/* LiPo Battery */}
+          {v.electronics && (
           <group
             position={[
               topPos[0],
-              topPos[1] + topPlateThickness + 15,
+              topPos[1] + topPlateTopY + 15 + explodeBatteryY,
               topPos[2],
             ]}
           >
@@ -818,139 +1988,192 @@ export function DroneModel({
               position={[25, 0, 0]}
             />
           </group>
+          )}
         </group>
 
-      {/* 3D Printed TPU Accessories */}
-      {showTPU && viewMode !== "print_layout" && (
-        <group>
-          {/* Action Camera Mount (GoPro) */}
-          <group
-            position={[
-              topPos[0],
-              topPos[1] + topPlateThickness / 2 + 2,
-              topPos[2] + fcMounting / 2 + 10,
-            ]}
-          >
-            <mesh castShadow receiveShadow material={tpuMaterial}>
-              <boxGeometry args={[24, 4, 20]} />
-            </mesh>
-            <mesh
-              position={[-4, 8, 0]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
+        {/* 3D Printed TPU Accessories */}
+        {v.accessories && showTPU && viewMode !== "print_layout" && (
+          <group>
+            {/* Action Camera Mount (GoPro) */}
+            <group
+              position={[
+                topPos[0],
+                topPos[1] + topPlateTopY + 2 + explodeTpuY,
+                topPos[2] + fcMounting / 2 + 10,
+              ]}
             >
-              <boxGeometry args={[3, 16, 15]} />
-            </mesh>
-            <mesh
-              position={[4, 8, 0]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
-            >
-              <boxGeometry args={[3, 16, 15]} />
-            </mesh>
-            <mesh
-              position={[-4, 16, 0]}
-              rotation={[Math.PI / 2, 0, Math.PI / 2]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
-            >
-              <cylinderGeometry args={[7.5, 7.5, 3, 16]} />
-            </mesh>
-            <mesh
-              position={[4, 16, 0]}
-              rotation={[Math.PI / 2, 0, Math.PI / 2]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
-            >
-              <cylinderGeometry args={[7.5, 7.5, 3, 16]} />
-            </mesh>
-            {viewMode === "exploded" && (
-              <Annotation
-                title="Action Cam Mount"
-                description="Flexible TPU GoPro Base"
-                position={[15, 10, 0]}
-              />
-            )}
-          </group>
+              <mesh castShadow receiveShadow material={tpuMaterial}>
+                <boxGeometry args={[24, 4, 20]} />
+              </mesh>
+              <mesh
+                position={[-4, 8, 0]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <boxGeometry args={[3, 16, 15]} />
+              </mesh>
+              <mesh
+                position={[4, 8, 0]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <boxGeometry args={[3, 16, 15]} />
+              </mesh>
+              <mesh
+                position={[-4, 16, 0]}
+                rotation={[Math.PI / 2, 0, Math.PI / 2]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <cylinderGeometry args={[7.5, 7.5, 3, 16]} />
+              </mesh>
+              <mesh
+                position={[4, 16, 0]}
+                rotation={[Math.PI / 2, 0, Math.PI / 2]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <cylinderGeometry args={[7.5, 7.5, 3, 16]} />
+              </mesh>
+              {viewMode === "exploded" && (
+                <Annotation
+                  title="Action Cam Mount"
+                  description="Flexible TPU GoPro Base"
+                  position={[15, 10, 0]}
+                />
+              )}
+            </group>
 
-          {/* Rear Antenna Mount */}
-          <group position={[bottomPos[0], standoffY, bottomPos[2] - fcMounting / 2 - 8]}>
-            <mesh castShadow receiveShadow material={tpuMaterial}>
-              <boxGeometry args={[20, standoffHeight, 6]} />
-            </mesh>
-            {/* VTX Antenna Tube */}
-            <mesh
-              position={[0, standoffHeight / 2 + 5, -5]}
-              rotation={[Math.PI / 6, 0, 0]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
+            {/* Rear Antenna Mount */}
+            <group
+              position={[
+                bottomPos[0],
+                standoffY + explodeTpuY,
+                bottomPos[2] - fcMounting / 2 - 8,
+              ]}
             >
-              <cylinderGeometry args={[3, 3, 20, 16]} />
-            </mesh>
-            {/* RX Antenna Tubes (Crossfire/ELRS) */}
-            <mesh
-              position={[-8, 0, -5]}
-              rotation={[Math.PI / 4, -Math.PI / 4, 0]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
-            >
-              <cylinderGeometry args={[2, 2, 30, 12]} />
-            </mesh>
-            <mesh
-              position={[8, 0, -5]}
-              rotation={[Math.PI / 4, Math.PI / 4, 0]}
-              castShadow
-              receiveShadow
-              material={tpuMaterial}
-            >
-              <cylinderGeometry args={[2, 2, 30, 12]} />
-            </mesh>
-            {viewMode === "exploded" && (
+              <mesh castShadow receiveShadow material={tpuMaterial}>
+                <boxGeometry args={[20, standoffHeight, 6]} />
+              </mesh>
+              {/* VTX Antenna Tube */}
+              <mesh
+                position={[0, standoffHeight / 2 + 5, -5]}
+                rotation={[Math.PI / 6, 0, 0]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <cylinderGeometry args={[3, 3, 20, 16]} />
+              </mesh>
+              {/* RX Antenna Tubes (Crossfire/ELRS) */}
+              <mesh
+                position={[-8, 0, -5]}
+                rotation={[Math.PI / 4, -Math.PI / 4, 0]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <cylinderGeometry args={[2, 2, 30, 12]} />
+              </mesh>
+              <mesh
+                position={[8, 0, -5]}
+                rotation={[Math.PI / 4, Math.PI / 4, 0]}
+                castShadow
+                receiveShadow
+                material={tpuMaterial}
+              >
+                <cylinderGeometry args={[2, 2, 30, 12]} />
+              </mesh>
               <Annotation
                 title="Antenna Array"
                 description="VTX + Diversity RX Tubes"
                 position={[15, 0, 0]}
               />
-            )}
-          </group>
+            </group>
 
-          {/* Arm Guards / Motor Bumpers */}
-          {motorPositions.map((pos, i) => {
-            const angle = i * (Math.PI / 2) + Math.PI / 4;
-            const motorPadRadius = motorMountPattern / 2 + 3.5;
-            return (
-              <group
-                key={`guard-${i}`}
-                position={[pos[0] + bottomPos[0], bottomPos[1], pos[2] + bottomPos[2]]}
-              >
-                <mesh
-                  rotation={[Math.PI / 2, 0, -angle - Math.PI / 2]}
-                  castShadow
-                  receiveShadow
-                  material={tpuMaterial}
+            {/* Arm Guards / Motor Bumpers */}
+            {motorPositions.map((pos, i) => {
+              const angle = i * (Math.PI / 2) + Math.PI / 4;
+              const motorPadRadius = motorMountPattern / 2 + 3.5;
+
+              const armLen = Math.max(1e-6, Math.hypot(pos[0], pos[2]));
+              const armDirX = pos[0] / armLen;
+              const armDirZ = pos[2] / armLen;
+              const explodeMotorRad = exploded ? 22 : 0;
+              const explodeMotorX = armDirX * explodeMotorRad;
+              const explodeMotorZ = armDirZ * explodeMotorRad;
+
+              return (
+                <group
+                  key={`guard-${i}`}
+                  position={[
+                    pos[0] + bottomPos[0] + explodeMotorX,
+                    bottomPos[1] + bottomPlateTopY + explodeMotorY,
+                    pos[2] + bottomPos[2] + explodeMotorZ,
+                  ]}
                 >
-                  <torusGeometry
-                    args={[motorPadRadius + 1, 2.5, 12, 24, Math.PI * 1.2]}
-                  />
-                </mesh>
-                {viewMode === "exploded" && i === 0 && (
-                  <Annotation
-                    title="Motor Bumpers"
-                    description="TPU Impact Protection"
-                    position={[15, 0, 0]}
-                  />
-                )}
-              </group>
-            );
-          })}
-        </group>
-      )}
+                  <mesh
+                    rotation={[Math.PI / 2, 0, -angle - Math.PI / 2]}
+                    castShadow
+                    receiveShadow
+                    material={tpuMaterial}
+                  >
+                    <torusGeometry
+                      args={[motorPadRadius + 1, 2.5, 12, 24, Math.PI * 1.2]}
+                    />
+                  </mesh>
+                  {viewMode === "exploded" && i === 0 && (
+                    <Annotation
+                      title="Motor Bumpers"
+                      description="TPU Impact Protection"
+                      position={[15, 0, 0]}
+                    />
+                  )}
+                </group>
+              );
+            })}
+          </group>
+        )}
+      </group>
     </group>
+  );
+
+  return physicsEnabled ? (
+    <RigidBody
+      type="dynamic"
+      colliders={false}
+      ref={viewMode === "flight_sim" ? flightBodyRef : undefined}
+      canSleep={viewMode === "flight_sim" ? false : undefined}
+      mass={massProps.massKg}
+      friction={1.1}
+      restitution={0.05}
+      linearDamping={viewMode === "flight_sim" ? 0.01 : 2.2}
+      angularDamping={viewMode === "flight_sim" ? 0.01 : 2.2}
+      gravityScale={1}
+      position={[0, viewMode === "flight_sim" ? flightSpawnLiftY : assemblySpawnLiftY, 0]}
+    >
+      <CuboidCollider
+        density={viewMode === "flight_sim" ? colliderDensity : 1e-6}
+        args={assemblyHalfExtents}
+        position={
+          viewMode === "flight_sim"
+            ? [
+                flightColliderOffset[0],
+                assemblyColliderCenterY + flightColliderOffset[1],
+                flightColliderOffset[2],
+              ]
+            : [0, assemblyColliderCenterY, 0]
+        }
+        friction={1.1}
+        restitution={0.05}
+      />
+      {droneVisual}
+    </RigidBody>
+  ) : (
+    droneVisual
   );
 }

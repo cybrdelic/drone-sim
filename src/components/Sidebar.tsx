@@ -1,10 +1,26 @@
-import React, { useState, useEffect } from "react";
-import { DroneParams, ViewMode } from "../types";
+import React, { useEffect, useState } from "react";
+import {
+  ComponentFocus,
+  ComponentVisibility,
+  DebugSettings,
+  DroneParams,
+  FlightTelemetry,
+  SimSettings,
+  ViewMode,
+  ViewSettings,
+} from "../types";
 
 interface SidebarProps {
   params: DroneParams;
   onChange: (params: DroneParams) => void;
   onExport: () => void;
+  viewSettings: ViewSettings;
+  onViewSettingsChange: (next: ViewSettings) => void;
+  simSettings: SimSettings;
+  onSimSettingsChange: (next: SimSettings) => void;
+  debugSettings?: DebugSettings;
+  onDebugSettingsChange?: (next: DebugSettings) => void;
+  flightTelemetry?: FlightTelemetry;
 }
 
 function ControlGroup({
@@ -112,12 +128,73 @@ function Select({ label, value, options, onChange }: SelectProps) {
   );
 }
 
-export function Sidebar({ params, onChange, onExport }: SidebarProps) {
+function Checkbox({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between gap-3">
+      <span className="text-[11px] font-medium text-neutral-300">{label}</span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-4 w-4 accent-emerald-400"
+      />
+    </label>
+  );
+}
+
+export function Sidebar({
+  params,
+  onChange,
+  onExport,
+  viewSettings,
+  onViewSettingsChange,
+  simSettings,
+  onSimSettingsChange,
+  debugSettings,
+  onDebugSettingsChange,
+  flightTelemetry,
+}: SidebarProps) {
+  const effectiveDebugSettings: DebugSettings =
+    debugSettings ?? ({ physicsLines: false, flightTelemetry: false } as DebugSettings);
+  const setDebugSettings = (next: DebugSettings) => {
+    if (onDebugSettingsChange) onDebugSettingsChange(next);
+  };
   const handleChange = <K extends keyof DroneParams>(
     key: K,
     value: DroneParams[K],
   ) => {
     onChange({ ...params, [key]: value });
+  };
+
+  const setVisibility = (next: Partial<ComponentVisibility>) => {
+    onViewSettingsChange({
+      ...viewSettings,
+      visibility: { ...viewSettings.visibility, ...next },
+      focus: "all",
+    });
+  };
+
+  const applyFocusPreset = (focus: ComponentFocus) => {
+    const presets: Record<ComponentFocus, ComponentVisibility> = {
+      all: { frame: true, propulsion: true, electronics: true, accessories: true },
+      frame: { frame: true, propulsion: false, electronics: false, accessories: false },
+      propulsion: { frame: false, propulsion: true, electronics: false, accessories: false },
+      electronics: { frame: false, propulsion: false, electronics: true, accessories: false },
+      accessories: { frame: false, propulsion: false, electronics: false, accessories: true },
+    };
+    onViewSettingsChange({
+      ...viewSettings,
+      focus,
+      visibility: presets[focus],
+    });
   };
 
   return (
@@ -157,6 +234,84 @@ export function Sidebar({ params, onChange, onExport }: SidebarProps) {
               </button>
             ))}
           </div>
+        </ControlGroup>
+
+        <ControlGroup title="Views">
+          <Checkbox
+            label="Wireframe"
+            checked={viewSettings.wireframe}
+            onChange={(checked) =>
+              onViewSettingsChange({ ...viewSettings, wireframe: checked })
+            }
+          />
+
+          <Select
+            label="Component View"
+            value={viewSettings.focus}
+            onChange={(v) => applyFocusPreset(v as ComponentFocus)}
+            options={[
+              { label: "All", value: "all" },
+              { label: "Frame", value: "frame" },
+              { label: "Propulsion (Motors/Props)", value: "propulsion" },
+              { label: "Electronics", value: "electronics" },
+              { label: "Accessories (TPU)", value: "accessories" },
+            ]}
+          />
+
+          <div className="grid grid-cols-1 gap-2">
+            <Checkbox
+              label="Frame"
+              checked={viewSettings.visibility.frame}
+              onChange={(checked) => setVisibility({ frame: checked })}
+            />
+            <Checkbox
+              label="Propulsion"
+              checked={viewSettings.visibility.propulsion}
+              onChange={(checked) => setVisibility({ propulsion: checked })}
+            />
+            <Checkbox
+              label="Electronics"
+              checked={viewSettings.visibility.electronics}
+              onChange={(checked) => setVisibility({ electronics: checked })}
+            />
+            <Checkbox
+              label="Accessories"
+              checked={viewSettings.visibility.accessories}
+              onChange={(checked) => setVisibility({ accessories: checked })}
+            />
+          </div>
+        </ControlGroup>
+
+        <ControlGroup title="Simulation">
+          <Checkbox
+            label="Motor / Prop Audio"
+            checked={simSettings.motorAudioEnabled}
+            onChange={(checked) =>
+              onSimSettingsChange({ ...simSettings, motorAudioEnabled: checked })
+            }
+          />
+          <Slider
+            label="Audio Volume"
+            value={simSettings.motorAudioVolume}
+            min={0}
+            max={1}
+            step={0.05}
+            unit=""
+            onChange={(v) =>
+              onSimSettingsChange({ ...simSettings, motorAudioVolume: v })
+            }
+          />
+          <Slider
+            label="Vibration Amount"
+            value={simSettings.vibrationAmount}
+            min={0}
+            max={1}
+            step={0.05}
+            unit=""
+            onChange={(v) =>
+              onSimSettingsChange({ ...simSettings, vibrationAmount: v })
+            }
+          />
         </ControlGroup>
 
         <ControlGroup title="Chassis Dimensions">
@@ -280,6 +435,68 @@ export function Sidebar({ params, onChange, onExport }: SidebarProps) {
                 { label: "Red", value: "#ef4444" },
               ]}
             />
+          )}
+        </ControlGroup>
+
+        <ControlGroup title="Debug">
+          <Checkbox
+            label="Show Physics Colliders"
+            checked={effectiveDebugSettings.physicsLines}
+            onChange={(checked) =>
+              setDebugSettings({ ...effectiveDebugSettings, physicsLines: checked })
+            }
+          />
+          <Checkbox
+            label="Show Flight Telemetry"
+            checked={effectiveDebugSettings.flightTelemetry}
+            onChange={(checked) =>
+              setDebugSettings({
+                ...effectiveDebugSettings,
+                flightTelemetry: checked,
+              })
+            }
+          />
+
+          {effectiveDebugSettings.flightTelemetry && (
+            <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-[11px] font-mono text-neutral-300">
+              {params.viewMode !== "flight_sim" ? (
+                <div className="text-neutral-500">
+                  Switch to flight sim to view telemetry.
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                  <div className="text-neutral-500">THR</div>
+                  <div className="text-right text-emerald-400">
+                    {(flightTelemetry?.throttle01 ?? 0).toFixed(2)}
+                  </div>
+
+                  <div className="text-neutral-500">T/W</div>
+                  <div className="text-right text-emerald-400">
+                    {(flightTelemetry?.tw ?? 0).toFixed(2)}
+                  </div>
+
+                  <div className="text-neutral-500">THRUST</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.thrustN ?? 0).toFixed(1)} N
+                  </div>
+
+                  <div className="text-neutral-500">WEIGHT</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.weightN ?? 0).toFixed(1)} N
+                  </div>
+
+                  <div className="text-neutral-500">ALT</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.altitudeM ?? 0).toFixed(2)} m
+                  </div>
+
+                  <div className="text-neutral-500">SPD</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.speedMS ?? 0).toFixed(2)} m/s
+                  </div>
+                </div>
+              )}
+            </div>
           )}
         </ControlGroup>
       </div>

@@ -1,0 +1,9 @@
+{
+  "params": { "viewMode": "flight_sim" },
+  "debugSettings": { "flightTelemetry": true, "physicsLines": true },
+  "waypoints": [
+    { "x": 0, "y": 220, "z": 0 },
+    { "x": 0, "y": 900, "z": 0 }
+  ],
+  "isFlyingPath": true
+}
