@@ -358,6 +358,75 @@ export function DroneModel({
     [tpuColor],
   );
 
+  // --- Fastener materials ---
+  const steelMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#2a2a2a",
+        roughness: 0.25,
+        metalness: 0.95,
+      }),
+    [],
+  );
+
+  const nylonMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#f5f5f5",
+        roughness: 0.7,
+        metalness: 0.05,
+      }),
+    [],
+  );
+
+  const rubberMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#333333",
+        roughness: 0.95,
+        metalness: 0.0,
+      }),
+    [],
+  );
+
+  const brassMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#d4a017",
+        roughness: 0.3,
+        metalness: 0.9,
+      }),
+    [],
+  );
+
+  // --- Reusable fastener geometries ---
+  const screwGeos = useMemo(() => {
+    // M3 button-head cap screw (BHCS): head ⌀5.7×1.65mm, shaft ⌀3×variable
+    const m3HeadGeo = new THREE.CylinderGeometry(2.85, 2.85, 1.65, 16);
+    // Socket drive hex recess (cosmetic)
+    const m3DriveGeo = new THREE.CylinderGeometry(1.3, 1.3, 0.8, 6);
+    // M3 shaft (length parameterized at render time via scale)
+    const m3ShaftGeo = new THREE.CylinderGeometry(1.5, 1.5, 1, 12);
+    // M3 nylon lock nut: ⌀6.01 hex × 4mm (modeled as cylinder for perf)
+    const m3NutGeo = new THREE.CylinderGeometry(3.0, 3.0, 4, 6);
+    // M3 nylon insert ring
+    const m3NylonRingGeo = new THREE.CylinderGeometry(2.8, 2.8, 1.2, 16);
+    // FC soft-mount grommet: ⌀7×3mm rubber with ⌀3.2 through-hole
+    const m3GrommetGeo = new THREE.TorusGeometry(3.5, 1.5, 8, 16);
+    // M2 screw head (for smaller motor patterns)
+    const m2HeadGeo = new THREE.CylinderGeometry(2.0, 2.0, 1.2, 16);
+    const m2ShaftGeo = new THREE.CylinderGeometry(1.0, 1.0, 1, 12);
+    // Prop nut (self-locking): ⌀8 flange × 5mm
+    const propNutGeo = new THREE.CylinderGeometry(4.0, 3.5, 5, 6);
+    // Battery strap (nylon webbing): flat box, rendered at usage site
+    const strapGeo = new THREE.BoxGeometry(12, 1.5, 3);
+
+    return {
+      m3HeadGeo, m3DriveGeo, m3ShaftGeo, m3NutGeo, m3NylonRingGeo,
+      m3GrommetGeo, m2HeadGeo, m2ShaftGeo, propNutGeo, strapGeo,
+    };
+  }, []);
+
   const propBladeGeo = useMemo(() => {
     const propR = (propSize * 25.4) / 2;
     const shape = new THREE.Shape();
@@ -622,6 +691,71 @@ export function DroneModel({
       weightReduction,
       evaluator,
     ]);
+
+  // Clearance check: compute prop-to-prop and prop-to-frame distances
+  const clearanceData = useMemo(() => {
+    if (viewMode !== "clearance_check") return null;
+    const propR = (propSize * 25.4) / 2;
+    const results: { type: string; distance: number; posA: THREE.Vector3; posB: THREE.Vector3; severity: "ok" | "warn" | "fail" }[] = [];
+
+    // Prop-to-prop clearance
+    for (let i = 0; i < motorPositions.length; i++) {
+      for (let j = i + 1; j < motorPositions.length; j++) {
+        const a = new THREE.Vector3(...motorPositions[i]);
+        const b = new THREE.Vector3(...motorPositions[j]);
+        const dist2D = Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2);
+        const gap = dist2D - 2 * propR;
+        results.push({
+          type: `Prop ${i + 1}↔${j + 1}`,
+          distance: gap,
+          posA: a,
+          posB: b,
+          severity: gap < 0 ? "fail" : gap < 3 ? "warn" : "ok",
+        });
+      }
+    }
+
+    // Prop-to-frame body clearance (prop tip to center body edge)
+    const centerRadius = fcMounting / 2 + 10;
+    for (let i = 0; i < motorPositions.length; i++) {
+      const mp = new THREE.Vector3(...motorPositions[i]);
+      const distToCenter = Math.sqrt(mp.x ** 2 + mp.z ** 2);
+      const tipInward = distToCenter - propR;
+      const gap = tipInward - centerRadius;
+      results.push({
+        type: `Prop ${i + 1}↔Body`,
+        distance: gap,
+        posA: mp,
+        posB: new THREE.Vector3(0, mp.y, 0),
+        severity: gap < 0 ? "fail" : gap < 2 ? "warn" : "ok",
+      });
+    }
+
+    // Prop-to-arm clearance: distance from prop disk edge to neighboring arm
+    for (let i = 0; i < motorPositions.length; i++) {
+      const mp = new THREE.Vector3(...motorPositions[i]);
+      for (const offset of [-1, 1]) {
+        const j = (i + offset + 4) % 4;
+        const armAngle = j * (Math.PI / 2) + Math.PI / 4;
+        const armDir = new THREE.Vector2(Math.cos(armAngle), Math.sin(armAngle));
+        const mPos2D = new THREE.Vector2(mp.x, mp.z);
+        const proj = armDir.clone().multiplyScalar(mPos2D.dot(armDir));
+        const perpDist = mPos2D.clone().sub(proj).length();
+        const gap = perpDist - propR - armWidth / 2;
+        if (gap < 5) {
+          results.push({
+            type: `Prop ${i + 1}↔Arm ${j + 1}`,
+            distance: gap,
+            posA: mp,
+            posB: new THREE.Vector3(proj.x, mp.y, proj.y),
+            severity: gap < 0 ? "fail" : gap < 2 ? "warn" : "ok",
+          });
+        }
+      }
+    }
+
+    return results;
+  }, [viewMode, propSize, motorPositions, fcMounting, armWidth]);
 
   const bottomPlateTopY = useMemo(() => {
     bottomPlateGeo.computeBoundingBox();
@@ -1081,6 +1215,9 @@ export function DroneModel({
     throttle01: 0 as number,
     targetWpIndex: 1 as number,
     rng: 123456789 as number,
+    // Wind model state
+    windPhase: null as number[] | null,
+    windTime: 0 as number,
   });
 
   React.useEffect(() => {
@@ -1098,6 +1235,8 @@ export function DroneModel({
       flightState.current.throttle01 = 0;
       flightState.current.targetWpIndex = 1;
       flightState.current.rng = 123456789;
+      flightState.current.windPhase = null;
+      flightState.current.windTime = 0;
     }
     if (!isFlyingPath) {
       flightState.current.targetWpIndex = 1;
@@ -1151,11 +1290,22 @@ export function DroneModel({
       if (!body) return;
 
       if (!flightInitDone.current) {
-        flightInitDone.current = true;
-        body.setTranslation({ x: 0, y: flightSpawnLiftY, z: 0 }, true);
-        body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-        body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+        const spawnY = Number.isFinite(flightSpawnLiftY)
+          ? flightSpawnLiftY
+          : Number.isFinite(assemblySpawnLiftY)
+            ? assemblySpawnLiftY
+            : 80;
+        try {
+          body.setTranslation({ x: 0, y: spawnY, z: 0 }, true);
+          body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+          body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+          flightInitDone.current = true;
+        } catch {
+          // If Rapier is in a bad state (e.g. after a hot reload), avoid crashing the render loop.
+          flightInitDone.current = false;
+          return;
+        }
       }
 
       // Read state from Rapier (world units are mm).
@@ -1342,9 +1492,9 @@ export function DroneModel({
         const maxRollRate = 2.6 * sens;
         const maxYawRate = 2.2 * sens;
 
-        // Self-level: compute tilt error from body-up vs world-up.
-        // This gives the drone real-world angle-mode stability (like Betaflight angle mode)
-        // so it returns to level when sticks are centered.
+        // Self-level: angle-mode attitude hold (like Betaflight angle mode)
+        // Computes tilt error between body-up and world-up, and additionally
+        // leans into horizontal velocity to provide velocity damping.
         const bodyUp = new THREE.Vector3(0, 1, 0).applyQuaternion(s.quat);
         const worldUp = new THREE.Vector3(0, 1, 0);
 
@@ -1354,11 +1504,30 @@ export function DroneModel({
         const tiltAngle = Math.acos(tiltDot); // 0 = level
 
         // Convert tilt correction axis to body frame
-        const kpLevel = 4.0; // proportional self-level gain (rad/s per rad error)
+        const kpLevel = 8.0; // proportional self-level gain (rad/s per rad error)
+        const kdLevel = 2.0; // derivative damping on angular rate
         let levelRateBody = new THREE.Vector3(0, 0, 0);
-        if (tiltAngle > 0.005) {
+        if (tiltAngle > 0.002) {
           const corrAxis = tiltCross.normalize().multiplyScalar(tiltAngle * kpLevel);
           levelRateBody = corrAxis.applyQuaternion(s.quat.clone().invert());
+        }
+        // Derivative damping: oppose current angular rate for stability
+        levelRateBody.add(s.omegaBody.clone().multiplyScalar(-kdLevel));
+
+        // Velocity damping: lean into horizontal velocity to oppose drift
+        // This simulates GPS-assisted position hold behavior
+        const vHoriz = new THREE.Vector3(s.velM.x, 0, s.velM.z);
+        const hSpeed = vHoriz.length();
+        if (hSpeed > 0.02) {
+          const kVelDamp = 1.5; // rad/s per m/s of horizontal speed
+          const maxLean = 0.8; // max lean rate contribution
+          const dampRate = Math.min(maxLean, hSpeed * kVelDamp);
+          // To oppose velocity V, we tilt the drone so thrust has a -V component.
+          // Tilt axis in world = up × normalize(V), and we rotate by a positive angle.
+          const vDir = vHoriz.clone().normalize();
+          const tiltAxis = vDir.clone().cross(worldUp).normalize().multiplyScalar(dampRate);
+          const dampRateBody = tiltAxis.applyQuaternion(s.quat.clone().invert());
+          levelRateBody.add(dampRateBody);
         }
 
         // Blend: stick input overrides self-level on the corresponding axis
@@ -1547,13 +1716,41 @@ export function DroneModel({
       // Net force in world (gravity is handled by Rapier).
       const thrustWorld = Fbody.clone().applyQuaternion(s.quat);
 
-      // Quadratic drag (rough)
-      const CdA = (frameSize / 210) * 0.012;
+      // Ground effect: thrust augmentation when altitude < 1 rotor diameter.
+      // Based on Cheeseman & Bennett (1955): T_ge/T = 1 / (1 - (R/(4*z))^2)
+      // where z = altitude, R = rotor radius.
+      {
+        const rotorR = (propSize * 25.4 / 2) * 1e-3; // prop radius in meters
+        const z = Math.max(0.01, s.posM.y); // altitude in meters
+        if (z < rotorR * 2) {
+          const ratio = rotorR / (4 * z);
+          const geMultiplier = 1 / Math.max(0.5, 1 - ratio * ratio);
+          // Only augment the vertical component
+          thrustWorld.y *= THREE.MathUtils.clamp(geMultiplier, 1.0, 1.4);
+        }
+      }
+
+      // Quadratic aerodynamic drag (parasitic + induced)
+      const CdA = (frameSize / 210) * 0.012; // parasitic drag area
       const v = s.velM;
       const speed = v.length();
       const dragWorld = speed > 1e-6
         ? v.clone().multiplyScalar(-0.5 * rho * CdA * speed)
         : new THREE.Vector3(0, 0, 0);
+
+      // Simple wind model: light random gusts that slowly vary
+      {
+        if (!s.windPhase) s.windPhase = [Math.random() * 100, Math.random() * 100, Math.random() * 100];
+        const windT = (s.windTime ?? 0) + dt;
+        s.windTime = windT;
+        // Perlin-like smooth wind using sin of different frequencies
+        const wx = 0.12 * Math.sin(windT * 0.4 + s.windPhase[0]) + 0.06 * Math.sin(windT * 1.1 + 7);
+        const wz = 0.12 * Math.sin(windT * 0.35 + s.windPhase[2]) + 0.06 * Math.sin(windT * 0.9 + 3);
+        // Scale wind force with altitude (ground shielding below ~0.5m)
+        const altFactor = THREE.MathUtils.smoothstep(s.posM.y, 0, 0.5);
+        const windForceN = new THREE.Vector3(wx * altFactor, 0, wz * altFactor);
+        dragWorld.add(windForceN);
+      }
 
       // Apply forces/torques to Rapier.
       // Rapier world uses mm, so: 1 N -> 1000 (kg*mm/s^2), 1 N*m -> 1e6 (kg*mm^2/s^2)
@@ -1758,25 +1955,65 @@ export function DroneModel({
         />
       )}
 
-      {/* Standoffs */}
+      {/* Standoffs with hex profile + top/bottom M3 screws */}
       {v.frame && showStandoffs &&
-        standoffsData.map((pos, i) => (
-          <mesh
-            key={i}
-            position={[pos[0], standoffY, pos[2]]}
-            castShadow
-            receiveShadow
-            material={aluminumMaterial}
-          >
-            <cylinderGeometry args={[2.5, 2.5, standoffHeight, 16]} />
-          </mesh>
-        ))}
+        standoffsData.map((pos, i) => {
+          const screwShaftLen = plateThickness + 2;
+          const explodeScrewSpread = exploded ? 12 : 0;
+          return (
+            <group key={`standoff-${i}`}>
+              {/* Hex standoff body */}
+              <mesh
+                position={[pos[0], standoffY, pos[2]]}
+                castShadow
+                receiveShadow
+                material={aluminumMaterial}
+              >
+                <cylinderGeometry args={[3.0, 3.0, standoffHeight, 6]} />
+              </mesh>
+              {/* Bottom screw (through bottom plate, into standoff) */}
+              <group position={[pos[0], bottomPlateTopY - plateThickness - explodeScrewSpread, pos[2]]}>
+                {/* Screw head */}
+                <mesh position={[0, -screwGeos.m3HeadGeo.parameters.height / 2, 0]} material={steelMaterial}>
+                  <cylinderGeometry args={[2.85, 2.85, 1.65, 16]} />
+                </mesh>
+                {/* Socket drive recess */}
+                <mesh position={[0, 0.1, 0]} material={steelMaterial}>
+                  <cylinderGeometry args={[1.3, 1.3, 0.8, 6]} />
+                </mesh>
+                {/* Shaft */}
+                <mesh position={[0, screwShaftLen / 2, 0]} material={steelMaterial}>
+                  <cylinderGeometry args={[1.5, 1.5, screwShaftLen, 12]} />
+                </mesh>
+              </group>
+              {/* Top screw (through top plate, into standoff) */}
+              <group position={[pos[0], topPos[1] + topPlateThickness + explodeScrewSpread, pos[2]]}>
+                <mesh position={[0, screwGeos.m3HeadGeo.parameters.height / 2, 0]} material={steelMaterial}>
+                  <cylinderGeometry args={[2.85, 2.85, 1.65, 16]} />
+                </mesh>
+                <mesh position={[0, -0.1, 0]} material={steelMaterial}>
+                  <cylinderGeometry args={[1.3, 1.3, 0.8, 6]} />
+                </mesh>
+                <mesh position={[0, -(screwShaftLen / 2), 0]} material={steelMaterial}>
+                  <cylinderGeometry args={[1.5, 1.5, screwShaftLen, 12]} />
+                </mesh>
+              </group>
+            </group>
+          );
+        })}
       {viewMode === "exploded" && showStandoffs && (
-        <Annotation
-          title="Knurled Standoffs"
-          description={`M3 x ${standoffHeight}mm 7075 Aluminum`}
-          position={[standoffsData[0][0] + 10, standoffY, standoffsData[0][2]]}
-        />
+        <>
+          <Annotation
+            title="Knurled Standoffs"
+            description={`M3 × ${standoffHeight}mm 7075-T6 Aluminum`}
+            position={[standoffsData[0][0] + 10, standoffY, standoffsData[0][2]]}
+          />
+          <Annotation
+            title="M3×8 BHCS"
+            description="Grade 12.9 Steel, 4× top + 4× bottom"
+            position={[standoffsData[1][0] + 10, bottomPlateTopY - plateThickness, standoffsData[1][2]]}
+          />
+        </>
       )}
 
       {/* Rigorous Clearance & Payload Visualization (Visible in all modes) */}
@@ -1814,10 +2051,38 @@ export function DroneModel({
                 {exploded && i === 0 && (
                   <Annotation
                     title="Motors + Props"
-                    description={`${motorMountPattern}x${motorMountPattern}mm mount • ${propSize.toFixed(1)}in props`}
+                    description={`${motorMountPattern}×${motorMountPattern}mm mount • ${propSize.toFixed(1)}in tri-blade`}
                     position={[motorRadius + 20, motorHeight + 18, 0]}
                   />
                 )}
+                {/* Motor mount screws (4× M3/M2 through bottom plate) */}
+                {[0, 1, 2, 3].map((j) => {
+                  const sAngle = j * (Math.PI / 2);
+                  const sX = Math.cos(sAngle) * (motorMountPattern / 2);
+                  const sZ = Math.sin(sAngle) * (motorMountPattern / 2);
+                  const isM3 = motorMountPattern >= 16;
+                  const headR = isM3 ? 2.85 : 2.0;
+                  const headH = isM3 ? 1.65 : 1.2;
+                  const shaftR = isM3 ? 1.5 : 1.0;
+                  const shaftLen = plateThickness + 3;
+                  const explodeScrewY = exploded ? -8 : 0;
+                  return (
+                    <group key={`mscrew-${j}`} position={[sX, explodeScrewY, sZ]}>
+                      {/* Screw head (underside of plate) */}
+                      <mesh position={[0, -plateThickness - headH / 2, 0]} material={steelMaterial}>
+                        <cylinderGeometry args={[headR, headR, headH, isM3 ? 16 : 12]} />
+                      </mesh>
+                      {/* Shaft up through plate into motor */}
+                      <mesh position={[0, -plateThickness / 2 + 1, 0]} material={steelMaterial}>
+                        <cylinderGeometry args={[shaftR, shaftR, shaftLen, 12]} />
+                      </mesh>
+                    </group>
+                  );
+                })}
+                {/* Prop nut (self-locking, on top of shaft) */}
+                <mesh position={[0, motorHeight + 10, 0]} castShadow material={steelMaterial}>
+                  <cylinderGeometry args={[4.0, 3.5, 5, 6]} />
+                </mesh>
                 {/* Motor Stator/Base */}
                 <mesh position={[0, motorHeight * 0.2, 0]} castShadow receiveShadow>
                   <cylinderGeometry
@@ -1905,7 +2170,7 @@ export function DroneModel({
           );
           })}
 
-          {/* FC Stack (Rigorous) */}
+          {/* FC Stack with soft-mount grommets & stack screws */}
           {v.electronics && (
           <group
             position={[
@@ -1914,10 +2179,39 @@ export function DroneModel({
               bottomPos[2],
             ]}
           >
-            {/* ESC */}
+            {/* FC Stack M3 screws + grommets (4×) */}
+            {[[-1, -1], [-1, 1], [1, -1], [1, 1]].map(([dx, dz], si) => {
+              const sx = dx * fcMounting / 2;
+              const sz = dz * fcMounting / 2;
+              return (
+                <group key={`fc-screw-${si}`} position={[sx, 0, sz]}>
+                  {/* Bottom grommet (between plate and ESC) */}
+                  <mesh position={[0, 1.5, 0]} material={rubberMaterial}>
+                    <cylinderGeometry args={[3.5, 3.5, 3, 16]} />
+                  </mesh>
+                  {/* Middle grommet (between ESC and FC) */}
+                  <mesh position={[0, 9, 0]} material={rubberMaterial}>
+                    <cylinderGeometry args={[3.5, 3.5, 3, 16]} />
+                  </mesh>
+                  {/* Stack screw shaft */}
+                  <mesh position={[0, 7, 0]} material={steelMaterial}>
+                    <cylinderGeometry args={[1.5, 1.5, 14, 12]} />
+                  </mesh>
+                  {/* Nylon lock nut on top */}
+                  <mesh position={[0, 14.5, 0]} material={steelMaterial}>
+                    <cylinderGeometry args={[3.0, 3.0, 3, 6]} />
+                  </mesh>
+                  {/* Nylon insert ring */}
+                  <mesh position={[0, 16.5, 0]} material={nylonMaterial}>
+                    <cylinderGeometry args={[2.8, 2.8, 1, 16]} />
+                  </mesh>
+                </group>
+              );
+            })}
+            {/* ESC board */}
             <mesh position={[0, 4, 0]}>
               <boxGeometry args={[fcMounting + 6, 4, fcMounting + 8]} />
-              <meshStandardMaterial color="#171717" />
+              <meshStandardMaterial color="#171717" roughness={0.9} metalness={0.1} />
             </mesh>
             {/* ESC Capacitor */}
             <mesh
@@ -1927,61 +2221,116 @@ export function DroneModel({
               <cylinderGeometry args={[4, 4, 12, 16]} />
               <meshStandardMaterial color="#0f172a" />
             </mesh>
+            {/* Capacitor leads (wires) */}
+            <mesh position={[0, 4, fcMounting / 2 + 1]} material={brassMaterial}>
+              <cylinderGeometry args={[0.4, 0.4, 8, 8]} />
+            </mesh>
 
-            {/* FC */}
+            {/* FC board */}
             <mesh position={[0, 12, 0]}>
               <boxGeometry args={[fcMounting + 4, 2, fcMounting + 4]} />
-              <meshStandardMaterial color="#171717" />
+              <meshStandardMaterial color="#171717" roughness={0.9} metalness={0.1} />
             </mesh>
-            {/* USB Port */}
+            {/* FC component detail: gyro chip */}
+            <mesh position={[3, 13.2, 2]}>
+              <boxGeometry args={[4, 0.4, 4]} />
+              <meshStandardMaterial color="#222" />
+            </mesh>
+            {/* FC component detail: MCU */}
+            <mesh position={[-4, 13.2, -3]}>
+              <boxGeometry args={[5, 0.5, 5]} />
+              <meshStandardMaterial color="#1a1a1a" />
+            </mesh>
+            {/* USB-C Port */}
             <mesh position={[fcMounting / 2 + 2, 12, 0]}>
-              <boxGeometry args={[3, 3, 8]} />
-              <meshStandardMaterial color="#cbd5e1" metalness={0.8} />
+              <boxGeometry args={[3, 2.5, 9]} />
+              <meshStandardMaterial color="#cbd5e1" metalness={0.8} roughness={0.2} />
             </mesh>
-            <Annotation
-              title="Flight Controller Stack"
-              description={`${fcMounting}x${fcMounting}mm ESC & FC`}
-              position={[fcMounting / 2 + 10, 12, 0]}
-            />
+            {viewMode === "exploded" && (
+              <>
+                <Annotation
+                  title="Flight Controller Stack"
+                  description={`${fcMounting}×${fcMounting}mm • ESC + FC + Soft Mount Grommets`}
+                  position={[fcMounting / 2 + 10, 12, 0]}
+                />
+                <Annotation
+                  title="M3 Stack Hardware"
+                  description="4× M3×20 BHCS + Rubber Grommets + Nyloc Nuts"
+                  position={[-(fcMounting / 2 + 10), 8, 0]}
+                />
+              </>
+            )}
+            {viewMode !== "exploded" && (
+              <Annotation
+                title="Flight Controller Stack"
+                description={`${fcMounting}×${fcMounting}mm ESC & FC`}
+                position={[fcMounting / 2 + 10, 12, 0]}
+              />
+            )}
           </group>
           )}
 
-          {/* FPV Camera (Micro 19x19) */}
+          {/* FPV Camera with TPU mount and adjustable tilt */}
           {v.electronics && (
           <group
             position={[
               bottomPos[0],
               bottomPos[1] + bottomPlateTopY + standoffHeight / 2 + explodeCameraY,
-              bottomPos[2] + fcMounting / 2 + 25,
+              bottomPos[2] + fcMounting / 2 + 18,
             ]}
           >
-            <mesh>
-              <boxGeometry args={[19, 19, 19]} />
-              <meshStandardMaterial color="#111" />
-            </mesh>
-            <mesh position={[0, 0, 10]} rotation={[Math.PI / 2, 0, 0]}>
-              <cylinderGeometry args={[7, 7, 8, 32]} />
-              <meshStandardMaterial color="#000" />
-            </mesh>
-            {/* FOV Cone */}
-            <mesh position={[0, 0, 30]} rotation={[-Math.PI / 2, 0, 0]}>
-              <cylinderGeometry args={[40, 0.1, 40, 32]} />
-              <meshStandardMaterial
-                color="#eab308"
-                transparent
-                opacity={0.1}
-                depthWrite={false}
-              />
-            </mesh>
+            {/* TPU camera mount cradle */}
+            {showTPU && viewMode !== "print_layout" && (
+              <group>
+                {/* Side plates */}
+                <mesh position={[-12, 0, 0]} material={tpuMaterial} castShadow>
+                  <boxGeometry args={[2, 22, 22]} />
+                </mesh>
+                <mesh position={[12, 0, 0]} material={tpuMaterial} castShadow>
+                  <boxGeometry args={[2, 22, 22]} />
+                </mesh>
+                {/* Bottom cradle */}
+                <mesh position={[0, -10, 0]} material={tpuMaterial} castShadow>
+                  <boxGeometry args={[22, 2, 22]} />
+                </mesh>
+              </group>
+            )}
+            {/* Camera body with 30° uptilt (standard FPV angle) */}
+            <group rotation={[-Math.PI * 30 / 180, 0, 0]}>
+              <mesh>
+                <boxGeometry args={[19, 19, 19]} />
+                <meshStandardMaterial color="#111" roughness={0.8} />
+              </mesh>
+              {/* Lens barrel */}
+              <mesh position={[0, 0, 10]} rotation={[Math.PI / 2, 0, 0]}>
+                <cylinderGeometry args={[7, 7, 8, 32]} />
+                <meshStandardMaterial color="#000" roughness={0.3} />
+              </mesh>
+              {/* Lens glass */}
+              <mesh position={[0, 0, 14.5]} rotation={[Math.PI / 2, 0, 0]}>
+                <cylinderGeometry args={[5.5, 5.5, 1, 32]} />
+                <meshStandardMaterial color="#1e3a5f" roughness={0.1} metalness={0.3} />
+              </mesh>
+              {/* FOV Cone */}
+              <mesh position={[0, 0, 35]} rotation={[-Math.PI / 2, 0, 0]}>
+                <cylinderGeometry args={[40, 0.1, 40, 32]} />
+                <meshStandardMaterial
+                  color="#eab308"
+                  transparent
+                  opacity={0.08}
+                  depthWrite={false}
+                />
+              </mesh>
+            </group>
             <Annotation
               title="FPV Camera"
-              description="19x19mm Micro Size + FOV"
+              description="19×19mm Micro • 30° Uptilt • 160° FOV"
               position={[15, 0, 0]}
             />
           </group>
           )}
 
-          {/* LiPo Battery */}
+          {/* LiPo Battery with straps, anti-slip pad, XT60 connector */}
           {v.electronics && (
           <group
             position={[
@@ -1990,29 +2339,154 @@ export function DroneModel({
               topPos[2],
             ]}
           >
+            {/* Anti-slip battery pad */}
+            <mesh position={[0, -15.5, 0]}>
+              <boxGeometry args={[38, 1, 78]} />
+              <meshStandardMaterial color="#333" roughness={0.95} metalness={0} />
+            </mesh>
+            {/* Battery cell body */}
             <mesh>
               <boxGeometry args={[35, 30, 75]} />
-              <meshStandardMaterial color="#475569" />
+              <meshStandardMaterial color="#475569" roughness={0.6} />
             </mesh>
-            <mesh position={[0, 0, 0]}>
+            {/* Heat shrink wrap */}
+            <mesh>
               <boxGeometry args={[36, 31, 76]} />
-              <meshStandardMaterial color="#000" wireframe />
+              <meshStandardMaterial color="#1e293b" transparent opacity={0.4} />
             </mesh>
-            {/* Battery XT60 Lead */}
-            <mesh position={[0, 0, -40]}>
-              <boxGeometry args={[15, 8, 10]} />
-              <meshStandardMaterial color="#eab308" />
+            {/* Battery label */}
+            <mesh position={[18.1, 0, 0]} rotation={[0, Math.PI / 2, 0]}>
+              <planeGeometry args={[40, 18]} />
+              <meshStandardMaterial color="#dc2626" roughness={0.9} />
             </mesh>
-            <Annotation
-              title="LiPo Battery"
-              description="6S 1300mAh Top Mount"
-              position={[25, 0, 0]}
-            />
+            {/* XT60 Connector */}
+            <group position={[0, 0, -40]}>
+              <mesh material={brassMaterial}>
+                <boxGeometry args={[16, 8, 7]} />
+              </mesh>
+              {/* XT60 pins */}
+              <mesh position={[-3, 0, -4]} material={brassMaterial}>
+                <cylinderGeometry args={[1.5, 1.5, 4, 8]} />
+              </mesh>
+              <mesh position={[3, 0, -4]} material={brassMaterial}>
+                <cylinderGeometry args={[1.5, 1.5, 4, 8]} />
+              </mesh>
+              {/* Silicone wires from XT60 */}
+              <mesh position={[-3, 0, -8]}>
+                <cylinderGeometry args={[1.8, 1.8, 12, 8]} />
+                <meshStandardMaterial color="#dc2626" roughness={0.8} />
+              </mesh>
+              <mesh position={[3, 0, -8]}>
+                <cylinderGeometry args={[1.8, 1.8, 12, 8]} />
+                <meshStandardMaterial color="#111" roughness={0.8} />
+              </mesh>
+            </group>
+            {/* Balance lead */}
+            <mesh position={[18, 3, 10]}>
+              <boxGeometry args={[3, 6, 14]} />
+              <meshStandardMaterial color="#f5f5f5" roughness={0.7} />
+            </mesh>
+            {/* Battery straps (×2) */}
+            {[-20, 20].map((zOff, si) => (
+              <group key={`strap-${si}`} position={[0, 0, zOff]}>
+                {/* Strap around battery */}
+                <mesh position={[0, 16, 0]}>
+                  <boxGeometry args={[38, 1.5, 12]} />
+                  <meshStandardMaterial color="#dc2626" roughness={0.6} />
+                </mesh>
+                <mesh position={[-19, 0, 0]}>
+                  <boxGeometry args={[1.5, 32, 12]} />
+                  <meshStandardMaterial color="#dc2626" roughness={0.6} />
+                </mesh>
+                <mesh position={[19, 0, 0]}>
+                  <boxGeometry args={[1.5, 32, 12]} />
+                  <meshStandardMaterial color="#dc2626" roughness={0.6} />
+                </mesh>
+                {/* Strap buckle */}
+                <mesh position={[0, 16.5, 0]} material={steelMaterial}>
+                  <boxGeometry args={[14, 2, 12]} />
+                </mesh>
+              </group>
+            ))}
+            {viewMode === "exploded" ? (
+              <>
+                <Annotation
+                  title="LiPo Battery"
+                  description={`6S ${propSize >= 7 ? '1800' : propSize >= 5 ? '1300' : '650'}mAh • XT60 Connector`}
+                  position={[25, 0, 0]}
+                />
+                <Annotation
+                  title="Battery Straps"
+                  description="2× Non-Slip Rubberized Nylon"
+                  position={[-25, 16, 0]}
+                />
+              </>
+            ) : (
+              <Annotation
+                title="LiPo Battery"
+                description={`6S ${propSize >= 7 ? '1800' : propSize >= 5 ? '1300' : '650'}mAh Top Mount`}
+                position={[25, 0, 0]}
+              />
+            )}
           </group>
           )}
         </group>
 
-        {/* 3D Printed TPU Accessories */}
+        {/* Clearance Check Visualization */}
+        {viewMode === "clearance_check" && clearanceData && (
+          <group>
+            {/* Prop sweep disks with clearance-colored rings */}
+            {motorPositions.map((pos, i) => {
+              const propR = (propSize * 25.4) / 2;
+              // Find worst severity for this prop
+              const propResults = clearanceData.filter(r => r.type.includes(`Prop ${i + 1}`));
+              const worstSeverity = propResults.some(r => r.severity === "fail") ? "fail"
+                : propResults.some(r => r.severity === "warn") ? "warn" : "ok";
+              const diskColor = worstSeverity === "fail" ? "#ef4444"
+                : worstSeverity === "warn" ? "#f59e0b" : "#22c55e";
+              return (
+                <group key={`clearance-disk-${i}`} position={[pos[0] + bottomPos[0], bottomPlateTopY + 18 + bottomPos[1], pos[2] + bottomPos[2]]}>
+                  {/* Clearance envelope disk */}
+                  <mesh>
+                    <cylinderGeometry args={[propR + 1, propR + 1, 1, 64]} />
+                    <meshStandardMaterial
+                      color={diskColor}
+                      transparent
+                      opacity={0.25}
+                      side={THREE.DoubleSide}
+                      depthWrite={false}
+                    />
+                  </mesh>
+                  {/* Outer ring */}
+                  <mesh>
+                    <torusGeometry args={[propR, 0.5, 8, 64]} />
+                    <meshStandardMaterial color={diskColor} />
+                  </mesh>
+                </group>
+              );
+            })}
+            {/* Clearance measurement lines */}
+            {clearanceData.map((item, ci) => {
+              const color = item.severity === "fail" ? "#ef4444"
+                : item.severity === "warn" ? "#f59e0b" : "#22c55e";
+              const mid = item.posA.clone().add(item.posB).multiplyScalar(0.5);
+              return (
+                <group key={`clearance-line-${ci}`}>
+                  <Annotation
+                    title={item.type}
+                    description={`${item.distance.toFixed(1)}mm ${item.severity === "fail" ? "⚠ INTERFERENCE" : item.severity === "warn" ? "⚠ TIGHT" : "✓ OK"}`}
+                    position={[mid.x, bottomPlateTopY + 25, mid.z]}
+                  />
+                </group>
+              );
+            })}
+            {/* Frame body clearance envelope */}
+            <mesh position={[0, bottomPlateTopY + 18, 0]}>
+              <cylinderGeometry args={[fcMounting / 2 + 10, fcMounting / 2 + 10, 1, 32]} />
+              <meshStandardMaterial color="#3b82f6" transparent opacity={0.12} side={THREE.DoubleSide} depthWrite={false} />
+            </mesh>
+          </group>
+        )}
         {v.accessories && showTPU && viewMode !== "print_layout" && (
           <group>
             {/* Action Camera Mount (GoPro) */}

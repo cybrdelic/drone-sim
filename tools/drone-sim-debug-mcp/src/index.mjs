@@ -278,7 +278,15 @@ server.tool(
     const commandFile = path.join(workspaceRoot, ".drone-sim-debug", "send.command.json");
     const commandFromFile = tryReadJson(commandFile);
 
-    const payload = unwrapped?.command ?? unwrapped ?? commandFromFile ?? { type: "get_state" };
+    // Some runners drop tool arguments entirely; treat an empty object as "no args".
+    const hasUserKeys =
+      unwrapped &&
+      typeof unwrapped === "object" &&
+      Object.keys(unwrapped).some((k) => k !== "signal" && k !== "input" && k !== "_meta");
+
+    const payload = hasUserKeys
+      ? (unwrapped?.command ?? unwrapped)
+      : (commandFromFile ?? { type: "get_state" });
     const res = await requestClient(payload, timeoutMs ?? 2000);
     return {
       content: [{ type: "text", text: JSON.stringify(res, null, 2) }],

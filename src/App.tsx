@@ -271,7 +271,15 @@ export default function App() {
           return;
         }
 
-        respond(id, { ok: false, error: "Unknown command" });
+        respond(id, {
+          ok: false,
+          error: `Unknown command (type=${String(type)})`,
+          received: {
+            topLevelKeys: msg && typeof msg === "object" ? Object.keys(msg) : [],
+            commandKeys:
+              command && typeof command === "object" ? Object.keys(command as any) : [],
+          },
+        });
       };
 
       ws.onclose = () => {
