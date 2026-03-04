@@ -1093,7 +1093,14 @@ export function DroneModel({
     -massProps.comMm.y,
     -massProps.comMm.z,
   ];
-  const flightSpawnLiftY = assemblySpawnLiftY + massProps.comMm.y;
+  // Spawn high enough to avoid strong ground effect (and immediate ground contact).
+  // Ground effect model applies up to ~2*rotorRadius = one prop diameter.
+  const flightSpawnLiftY = useMemo(() => {
+    const baseMm = assemblySpawnLiftY + massProps.comMm.y;
+    const propDiameterMm = propSize * 25.4;
+    const minMm = propDiameterMm + 150;
+    return Math.max(baseMm, minMm);
+  }, [assemblySpawnLiftY, massProps.comMm.y, propSize]);
 
   // Compute the correct collider density so Rapier gets the right total mass.
   // Volume of the cuboid = 8 * hx * hy * hz (in mm³ since world is mm-scale).
@@ -1481,7 +1488,11 @@ export function DroneModel({
         // Manual: throttle around hover + stick input
         const sens = THREE.MathUtils.clamp(controlSensitivity, 0.2, 1);
         const throttleDelta = (keys.current.space ? 1 : 0) - (keys.current.shift ? 1 : 0);
-        const targetThrottle = hoverThrottle01 + throttleDelta * (0.18 * sens);
+        // Neutral throttle aims for hover, but small modeling biases can create a slow climb/sink.
+        // Add a light vertical-velocity damper when the user is not actively commanding throttle.
+        const kVzDamp = 0.045; // throttle fraction per (m/s) vertical speed
+        const vzDamp = throttleDelta === 0 ? THREE.MathUtils.clamp(-s.velM.y * kVzDamp, -0.08, 0.08) : 0;
+        const targetThrottle = hoverThrottle01 + throttleDelta * (0.18 * sens) + vzDamp;
         throttleCmd01 = clamp01(targetThrottle);
 
         const pitchCmd = (keys.current.s ? 1 : 0) - (keys.current.w ? 1 : 0);
@@ -1755,7 +1766,7 @@ export function DroneModel({
       // Apply forces/torques to Rapier.
       // Rapier world uses mm, so: 1 N -> 1000 (kg*mm/s^2), 1 N*m -> 1e6 (kg*mm^2/s^2)
       {
-        const forceWorldN = thrustWorld.add(dragWorld);
+        const forceWorldN = thrustWorld.clone().add(dragWorld);
         const torqueWorldNm = torqueBodyNm.clone().applyQuaternion(s.quat);
 
         body.resetForces(true);
