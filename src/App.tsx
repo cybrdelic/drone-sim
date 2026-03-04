@@ -254,6 +254,15 @@ export default function App() {
         const command = msg?.command && typeof msg.command === "object" ? msg.command : msg;
         const type = command?.type;
 
+        // Compatibility: some tool runners fail to forward tool arguments and we may receive
+        // a message with only an id (no command/type). Treat that as a get_state request so
+        // the tooling remains usable.
+        const topLevelKeys = msg && typeof msg === "object" ? Object.keys(msg) : [];
+        if (!type && topLevelKeys.length === 1 && topLevelKeys[0] === "id") {
+          respond(id, { ok: true, state: snapshot() });
+          return;
+        }
+
         if (type === "get_state") {
           respond(id, { ok: true, state: snapshot() });
           return;
@@ -275,7 +284,7 @@ export default function App() {
           ok: false,
           error: `Unknown command (type=${String(type)})`,
           received: {
-            topLevelKeys: msg && typeof msg === "object" ? Object.keys(msg) : [],
+            topLevelKeys,
             commandKeys:
               command && typeof command === "object" ? Object.keys(command as any) : [],
           },
