@@ -1341,10 +1341,31 @@ export function DroneModel({
         const maxPitchRate = 2.2 * sens;
         const maxRollRate = 2.6 * sens;
         const maxYawRate = 2.2 * sens;
+
+        // Self-level: compute tilt error from body-up vs world-up.
+        // This gives the drone real-world angle-mode stability (like Betaflight angle mode)
+        // so it returns to level when sticks are centered.
+        const bodyUp = new THREE.Vector3(0, 1, 0).applyQuaternion(s.quat);
+        const worldUp = new THREE.Vector3(0, 1, 0);
+
+        // Tilt axis (world) = bodyUp × worldUp, angle = acos(dot)
+        const tiltCross = bodyUp.clone().cross(worldUp);
+        const tiltDot = THREE.MathUtils.clamp(bodyUp.dot(worldUp), -1, 1);
+        const tiltAngle = Math.acos(tiltDot); // 0 = level
+
+        // Convert tilt correction axis to body frame
+        const kpLevel = 4.0; // proportional self-level gain (rad/s per rad error)
+        let levelRateBody = new THREE.Vector3(0, 0, 0);
+        if (tiltAngle > 0.005) {
+          const corrAxis = tiltCross.normalize().multiplyScalar(tiltAngle * kpLevel);
+          levelRateBody = corrAxis.applyQuaternion(s.quat.clone().invert());
+        }
+
+        // Blend: stick input overrides self-level on the corresponding axis
         desiredRateBody.set(
-          pitchCmd * maxPitchRate,
+          pitchCmd !== 0 ? pitchCmd * maxPitchRate : levelRateBody.x,
           yawCmd * maxYawRate,
-          rollCmd * maxRollRate,
+          rollCmd !== 0 ? rollCmd * maxRollRate : levelRateBody.z,
         );
       }
 
