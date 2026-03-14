@@ -1,18 +1,27 @@
 import {
-    ContactShadows,
-    Environment,
-    Grid,
     OrbitControls,
 } from "@react-three/drei";
 import { Canvas } from "@react-three/fiber";
-import { CuboidCollider, Physics, RigidBody } from "@react-three/rapier";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
-import { STLExporter } from "three/examples/jsm/exporters/STLExporter.js";
+import { AgXToneMapping, SRGBColorSpace, WebGPURenderer } from "three/webgpu";
 import { DroneModel } from "./components/DroneModel";
-import { RapierDebugLines } from "./components/RapierDebugLines";
+import { GamepadDiagram } from "./components/GamepadDiagram";
 import { Sidebar } from "./components/Sidebar";
+import { WebgpuGridIntegration } from "./components/WebgpuGridIntegration";
 import { DebugSettings, DroneParams, FlightTelemetry, SimSettings, ViewSettings } from "./types";
+
+const LazyRapierDebugLines = lazy(() =>
+  import("./components/RapierDebugLines").then((m) => ({
+    default: m.RapierDebugLines,
+  })),
+);
+
+type RapierBundle = {
+  Physics: any;
+  RigidBody: any;
+  CuboidCollider: any;
+};
 
 const defaultParams: DroneParams = {
   frameSize: 210, // 5-inch standard
@@ -33,6 +42,12 @@ const defaultParams: DroneParams = {
 export default function App() {
   const [params, setParams] = useState<DroneParams>(defaultParams);
   const groupRef = useRef<THREE.Group>(null);
+  const viewportRef = useRef<HTMLElement | null>(null);
+  const [rendererBackend, setRendererBackend] = useState<"webgpu" | "webgl2" | "unknown">(
+    "unknown",
+  );
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [arePanelsVisible, setArePanelsVisible] = useState(true);
   const [waypoints, setWaypoints] = useState<THREE.Vector3[]>([]);
   const [isFlyingPath, setIsFlyingPath] = useState(false);
   const [controlSensitivity, setControlSensitivity] = useState(0.45);
@@ -65,10 +80,44 @@ export default function App() {
     tw: 0,
     altitudeM: 0,
     speedMS: 0,
+    airspeedMS: 0,
+    windMS: 0,
+    groundEffectMult: 1,
+    batteryV: 0,
+    batteryI: 0,
+    armed: false,
   });
   const [flightTelemetry, setFlightTelemetry] = useState<FlightTelemetry>(
     flightTelemetryRef.current,
   );
+
+  const glFactory = useCallback(async (props: { canvas: HTMLCanvasElement | OffscreenCanvas }) => {
+    const renderer = new WebGPURenderer({
+      canvas: props.canvas as any,
+      antialias: true,
+      alpha: true,
+      logarithmicDepthBuffer: true,
+    });
+
+    await renderer.init();
+
+    if (typeof (renderer as any).setClearColor === "function") {
+      (renderer as any).setClearColor(0x000000, 0);
+    }
+
+    renderer.outputColorSpace = SRGBColorSpace;
+    renderer.toneMapping = AgXToneMapping;
+    renderer.toneMappingExposure = 1.02;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.VSMShadowMap;
+
+    const backend = (renderer as any).backend;
+    const isWebGPU = !!backend?.isWebGPUBackend || String(backend?.constructor?.name || "").toLowerCase().includes("webgpu");
+    const isWebGL = !!backend?.isWebGLBackend || String(backend?.constructor?.name || "").toLowerCase().includes("webgl");
+    setRendererBackend(isWebGPU ? "webgpu" : isWebGL ? "webgl2" : "unknown");
+
+    return renderer as any;
+  }, []);
 
   const paramsRef = useRef(params);
   const viewSettingsRef = useRef(viewSettings);
@@ -95,6 +144,34 @@ export default function App() {
   useEffect(() => {
     isFlyingPathRef.current = isFlyingPath;
   }, [isFlyingPath]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(document.fullscreenElement === viewportRef.current);
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    handleFullscreenChange();
+
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    try {
+      if (document.fullscreenElement === viewport) {
+        await document.exitFullscreen();
+      } else if (!document.fullscreenElement) {
+        await viewport.requestFullscreen();
+      }
+    } catch {
+      // Ignore fullscreen API failures; they are user-agent controlled.
+    }
+  }, []);
 
   useEffect(() => {
     // Debug-bridge client: silently attaches to the local MCP debug server.
@@ -418,19 +495,22 @@ export default function App() {
   }, [flightPathLine]);
 
   const handleExport = () => {
-    if (!groupRef.current) return;
-    const exporter = new STLExporter();
-    const stlString = exporter.parse(groupRef.current);
-    const blob = new Blob([stlString], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.style.display = "none";
-    link.href = url;
-    link.download = `aeroforge_production_${params.frameSize}mm.stl`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    (async () => {
+      if (!groupRef.current) return;
+      const mod = await import("three/examples/jsm/exporters/STLExporter.js");
+      const exporter = new mod.STLExporter();
+      const stlString = exporter.parse(groupRef.current);
+      const blob = new Blob([stlString], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.style.display = "none";
+      link.href = url;
+      link.download = `aeroforge_production_${params.frameSize}mm.stl`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    })();
   };
 
   // Rigorous Engineering & Kinematics Calculations
@@ -509,165 +589,279 @@ export default function App() {
     };
   }, [params]);
 
+  const rapierCacheRef = useRef<RapierBundle | null>(null);
+  const rapierLoadPromiseRef = useRef<Promise<RapierBundle> | null>(null);
+  const [rapier, setRapier] = useState<RapierBundle | null>(null);
+  const needsRapier = params.viewMode === "flight_sim" || debugSettings.physicsLines;
+
+  // Prefetch Rapier after initial paint so flight_sim can become interactive immediately,
+  // without forcing Rapier onto the critical-path bundle.
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = () => {
+      if (rapierCacheRef.current) return;
+      if (!rapierLoadPromiseRef.current) {
+        rapierLoadPromiseRef.current = import("@react-three/rapier").then((m) => {
+          const bundle: RapierBundle = {
+            Physics: (m as any).Physics,
+            RigidBody: (m as any).RigidBody,
+            CuboidCollider: (m as any).CuboidCollider,
+          };
+          rapierCacheRef.current = bundle;
+          return bundle;
+        });
+      }
+
+      rapierLoadPromiseRef.current
+        .then((bundle) => {
+          if (cancelled) return;
+          if (needsRapier) setRapier(bundle);
+        })
+        .catch(() => {
+          // ignore: if Rapier fails to load we just won't mount physics.
+        });
+    };
+
+    const w = typeof window !== "undefined" ? (window as any) : null;
+    if (w && typeof w.requestIdleCallback === "function") {
+      w.requestIdleCallback(load, { timeout: 2000 });
+    } else {
+      // Start prefetch ASAP (after current paint).
+      window.setTimeout(load, 0);
+    }
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!needsRapier) {
+      // Keep the module cached for fast re-entry into flight_sim,
+      // but avoid mounting the physics tree.
+      setRapier(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (rapierCacheRef.current) {
+      setRapier(rapierCacheRef.current);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const promise =
+      rapierLoadPromiseRef.current ??
+      (rapierLoadPromiseRef.current = import("@react-three/rapier").then((m) => {
+        const bundle: RapierBundle = {
+          Physics: (m as any).Physics,
+          RigidBody: (m as any).RigidBody,
+          CuboidCollider: (m as any).CuboidCollider,
+        };
+        rapierCacheRef.current = bundle;
+        return bundle;
+      }));
+
+    promise
+      .then((bundle) => {
+        if (cancelled) return;
+        setRapier(bundle);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setRapier(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [needsRapier]);
+
   return (
     <div className="flex h-screen w-full bg-[#0a0a0a] overflow-hidden font-sans text-neutral-200">
-      <Sidebar
-        params={params}
-        onChange={setParams}
-        onExport={handleExport}
-        viewSettings={viewSettings}
-        onViewSettingsChange={setViewSettings}
-        simSettings={simSettings}
-        onSimSettingsChange={setSimSettings}
-        debugSettings={debugSettings}
-        onDebugSettingsChange={setDebugSettings}
-        flightTelemetry={flightTelemetry}
-      />
+      {arePanelsVisible && (
+        <Sidebar
+          params={params}
+          onChange={setParams}
+          onExport={handleExport}
+          viewSettings={viewSettings}
+          onViewSettingsChange={setViewSettings}
+          simSettings={simSettings}
+          onSimSettingsChange={setSimSettings}
+          debugSettings={debugSettings}
+          onDebugSettingsChange={setDebugSettings}
+          flightTelemetry={flightTelemetry}
+        />
+      )}
 
-      <main className="flex-1 relative cursor-move">
-        {/* Frame Specs Panel (Top Left) */}
-        <div className="absolute top-4 left-4 z-10 pointer-events-none">
-          <div className="bg-[#111]/90 backdrop-blur border border-neutral-800 p-4 rounded-lg shadow-2xl">
-            <h2 className="text-xs font-bold uppercase tracking-widest text-neutral-100 mb-3">
-              Frame Specifications
-            </h2>
-            <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-[11px] font-mono text-neutral-400">
-              <div>CLASS</div>
-              <div className="text-emerald-400 text-right">
-                {params.frameSize >= 250
-                  ? "7-INCH"
-                  : params.frameSize >= 200
-                    ? "5-INCH"
-                    : "3-INCH"}
-              </div>
-
-              <div>DIAGONAL</div>
-              <div className="text-neutral-200 text-right">
-                {params.frameSize.toFixed(1)} mm
-              </div>
-
-              <div>STACK</div>
-              <div className="text-neutral-200 text-right">
-                {params.fcMounting}x{params.fcMounting} mm
-              </div>
-
-              <div>MOTORS</div>
-              <div className="text-neutral-200 text-right">
-                {params.motorMountPattern}x{params.motorMountPattern} mm
-              </div>
-
-              <div>Z-HEIGHT</div>
-              <div className="text-neutral-200 text-right">
-                {(
-                  params.plateThickness +
-                  params.standoffHeight +
-                  params.topPlateThickness
-                ).toFixed(1)}{" "}
-                mm
-              </div>
-            </div>
-          </div>
+      <main ref={viewportRef} className="flex-1 relative cursor-move">
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setArePanelsVisible((prev) => !prev)}
+            className="bg-neutral-950/85 text-neutral-100 border border-neutral-700 hover:border-emerald-500/60 hover:text-white px-4 py-2 rounded-full text-[11px] uppercase tracking-[0.22em] shadow-2xl backdrop-blur transition-colors"
+          >
+            {arePanelsVisible ? "Hide Panels" : "Show Panels"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void toggleFullscreen();
+            }}
+            className="bg-neutral-950/85 text-neutral-100 border border-neutral-700 hover:border-emerald-500/60 hover:text-white px-4 py-2 rounded-full text-[11px] uppercase tracking-[0.22em] shadow-2xl backdrop-blur transition-colors"
+          >
+            {isFullscreen ? "Exit Fullscreen" : "Fullscreen View"}
+          </button>
         </div>
 
-        {/* Engineering Telemetry Panel (Top Right) */}
-        <div className="absolute top-4 right-4 z-10 pointer-events-none w-80">
-          <div className="bg-[#111]/90 backdrop-blur border border-neutral-800 p-4 rounded-lg shadow-2xl">
-            <h2 className="text-[10px] font-bold uppercase tracking-widest text-emerald-500 mb-4 flex items-center gap-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              Engineering & Kinematics
-            </h2>
-
-            <div className="space-y-4">
-              {/* Materials & Tolerances */}
-              <div>
-                <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                  Material Specs
-                </div>
-                <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                  <div className="text-neutral-400">COMPOSITE</div>
-                  <div className="text-neutral-200 text-right">
-                    Toray T700 3K
-                  </div>
-                  <div className="text-neutral-400">DENSITY</div>
-                  <div className="text-neutral-200 text-right">1.60 g/cm³</div>
-                  <div className="text-neutral-400">TOLERANCE</div>
-                  <div className="text-neutral-200 text-right">±0.05 mm</div>
-                </div>
-              </div>
-
-              {/* Mass Analysis */}
-              <div>
-                <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                  Mass Analysis
-                </div>
-                <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                  <div className="text-neutral-400">DRY FRAME</div>
-                  <div className="text-neutral-200 text-right">
-                    {engData.frameWeight_g.toFixed(1)} g
-                  </div>
-                  <div className="text-neutral-400">EST. AUW</div>
-                  <div className="text-neutral-200 text-right">
-                    {engData.auw_g.toFixed(1)} g
-                  </div>
-                </div>
-              </div>
-
-              {/* Aerodynamics */}
-              <div>
-                <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                  Aerodynamics (Max)
-                </div>
-                <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                  <div className="text-neutral-400">TOTAL LIFT</div>
-                  <div className="text-neutral-200 text-right">
-                    {engData.totalThrust_g.toFixed(0)} g
-                  </div>
-                  <div className="text-neutral-400">T/W RATIO</div>
+        {arePanelsVisible && (
+          <>
+            {/* Frame Specs Panel (Top Left) */}
+            <div className="absolute top-4 left-4 z-10 pointer-events-none">
+              <div className="bg-[#111]/90 backdrop-blur border border-neutral-800 p-4 rounded-lg shadow-2xl">
+                <h2 className="text-xs font-bold uppercase tracking-widest text-neutral-100 mb-3">
+                  Frame Specifications
+                </h2>
+                <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-[11px] font-mono text-neutral-400">
+                  <div>CLASS</div>
                   <div className="text-emerald-400 text-right">
-                    {engData.twRatio.toFixed(2)} : 1
+                    {params.frameSize >= 250
+                      ? "7-INCH"
+                      : params.frameSize >= 200
+                        ? "5-INCH"
+                        : "3-INCH"}
                   </div>
-                  <div className="text-neutral-400">HOVER THR.</div>
-                  <div className="text-neutral-200 text-right">
-                    {engData.hoverThrottle.toFixed(1)} %
-                  </div>
-                </div>
-              </div>
 
-              {/* Structural Integrity */}
-              <div>
-                <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                  Structural Integrity
-                </div>
-                <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                  <div className="text-neutral-400">ARM TENSION</div>
+                  <div>DIAGONAL</div>
                   <div className="text-neutral-200 text-right">
-                    {engData.maxStress_MPa.toFixed(1)} MPa
+                    {params.frameSize.toFixed(1)} mm
                   </div>
-                  <div className="text-neutral-400">YIELD STRENGTH</div>
-                  <div className="text-neutral-200 text-right">600.0 MPa</div>
-                  <div className="text-neutral-400">SAFETY FACTOR</div>
-                  <div
-                    className={`text-right font-bold ${engData.safetyFactor < 1.5 ? "text-rose-500" : engData.safetyFactor < 3 ? "text-yellow-500" : "text-emerald-500"}`}
-                  >
-                    {engData.safetyFactor.toFixed(2)}x
+
+                  <div>STACK</div>
+                  <div className="text-neutral-200 text-right">
+                    {params.fcMounting}x{params.fcMounting} mm
                   </div>
-                </div>
-                {/* Stress Bar */}
-                <div className="mt-2 h-1.5 w-full bg-neutral-800 rounded-full overflow-hidden">
-                  <div
-                    className={`h-full transition-all duration-300 ${engData.safetyFactor < 1.5 ? "bg-rose-500" : engData.safetyFactor < 3 ? "bg-yellow-500" : "bg-emerald-500"}`}
-                    style={{
-                      width: `${Math.min((600 / engData.maxStress_MPa) * 20, 100)}%`,
-                    }}
-                  />
+
+                  <div>MOTORS</div>
+                  <div className="text-neutral-200 text-right">
+                    {params.motorMountPattern}x{params.motorMountPattern} mm
+                  </div>
+
+                  <div>Z-HEIGHT</div>
+                  <div className="text-neutral-200 text-right">
+                    {(
+                      params.plateThickness +
+                      params.standoffHeight +
+                      params.topPlateThickness
+                    ).toFixed(1)}{" "}
+                    mm
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-        </div>
+
+            {/* Engineering Telemetry Panel (Top Right) */}
+            <div className="absolute top-4 right-4 z-10 pointer-events-none w-80">
+              <div className="bg-[#111]/90 backdrop-blur border border-neutral-800 p-4 rounded-lg shadow-2xl">
+                <h2 className="text-[10px] font-bold uppercase tracking-widest text-emerald-500 mb-4 flex items-center gap-2">
+                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  Engineering & Kinematics
+                </h2>
+
+                <div className="space-y-4">
+                  <div>
+                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                      Material Specs
+                    </div>
+                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                      <div className="text-neutral-400">COMPOSITE</div>
+                      <div className="text-neutral-200 text-right">
+                        Toray T700 3K
+                      </div>
+                      <div className="text-neutral-400">DENSITY</div>
+                      <div className="text-neutral-200 text-right">1.60 g/cm³</div>
+                      <div className="text-neutral-400">TOLERANCE</div>
+                      <div className="text-neutral-200 text-right">±0.05 mm</div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                      Mass Analysis
+                    </div>
+                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                      <div className="text-neutral-400">DRY FRAME</div>
+                      <div className="text-neutral-200 text-right">
+                        {engData.frameWeight_g.toFixed(1)} g
+                      </div>
+                      <div className="text-neutral-400">EST. AUW</div>
+                      <div className="text-neutral-200 text-right">
+                        {engData.auw_g.toFixed(1)} g
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                      Aerodynamics (Max)
+                    </div>
+                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                      <div className="text-neutral-400">TOTAL LIFT</div>
+                      <div className="text-neutral-200 text-right">
+                        {engData.totalThrust_g.toFixed(0)} g
+                      </div>
+                      <div className="text-neutral-400">T/W RATIO</div>
+                      <div className="text-emerald-400 text-right">
+                        {engData.twRatio.toFixed(2)} : 1
+                      </div>
+                      <div className="text-neutral-400">HOVER THR.</div>
+                      <div className="text-neutral-200 text-right">
+                        {engData.hoverThrottle.toFixed(1)} %
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                      Structural Integrity
+                    </div>
+                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                      <div className="text-neutral-400">ARM TENSION</div>
+                      <div className="text-neutral-200 text-right">
+                        {engData.maxStress_MPa.toFixed(1)} MPa
+                      </div>
+                      <div className="text-neutral-400">YIELD STRENGTH</div>
+                      <div className="text-neutral-200 text-right">600.0 MPa</div>
+                      <div className="text-neutral-400">SAFETY FACTOR</div>
+                      <div
+                        className={`text-right font-bold ${engData.safetyFactor < 1.5 ? "text-rose-500" : engData.safetyFactor < 3 ? "text-yellow-500" : "text-emerald-500"}`}
+                      >
+                        {engData.safetyFactor.toFixed(2)}x
+                      </div>
+                    </div>
+                    <div className="mt-2 h-1.5 w-full bg-neutral-800 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full transition-all duration-300 ${engData.safetyFactor < 1.5 ? "bg-rose-500" : engData.safetyFactor < 3 ? "bg-yellow-500" : "bg-emerald-500"}`}
+                        style={{
+                          width: `${Math.min((600 / engData.maxStress_MPa) * 20, 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
 
         {/* Flight Sim Controls Overlay */}
-        {params.viewMode === "flight_sim" && (
+        {arePanelsVisible && params.viewMode === "flight_sim" && (
           <>
             <div className="absolute top-24 left-1/2 -translate-x-1/2 z-10 flex gap-4 pointer-events-auto">
               <div className="bg-neutral-900/80 text-neutral-400 px-3 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center gap-2">
@@ -724,7 +918,7 @@ export default function App() {
                 {isFlyingPath ? "Flying..." : "Fly Path"}
               </button>
               <div className="bg-neutral-900/80 text-neutral-400 px-4 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center">
-                Click on the grid to add waypoints
+                Click on the ground to add waypoints
               </div>
             </div>
             <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
@@ -774,37 +968,131 @@ export default function App() {
               </div>
             </div>
           </div>
+
+            <div className="absolute bottom-4 right-4 z-10 pointer-events-none">
+              <GamepadDiagram />
+            </div>
+
+            <div className="absolute bottom-4 left-4 z-10 pointer-events-none">
+              <div
+                className={
+                  "text-[10px] font-mono px-2 py-1 rounded border backdrop-blur " +
+                  (rendererBackend === "webgpu"
+                    ? "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
+                    : rendererBackend === "webgl2"
+                      ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
+                      : "text-neutral-400 border-neutral-700 bg-neutral-900/70")
+                }
+              >
+                {rendererBackend === "webgpu"
+                  ? "Renderer: WebGPU"
+                  : rendererBackend === "webgl2"
+                    ? "Renderer: WebGL2 fallback"
+                    : "Renderer: (unknown)"}
+              </div>
+            </div>
           </>
         )}
 
         <Canvas
-          camera={{ position: [120, 100, 120], fov: 45, near: 0.1, far: 100000 }}
-          onCreated={({ camera }) => {
-            camera.near = 0.1;
-            camera.far = 100000;
+          dpr={[1, 1.8]}
+          camera={{
+            // Frame the quad at a usable default distance in the sim's mm world.
+            position: [2600, 1450, 2600],
+            fov: 55,
+            near: 50,
+            far: 500000,
+          }}
+          onCreated={({ camera, scene }) => {
+            scene.background = null;
             camera.updateProjectionMatrix();
           }}
-          gl={{ logarithmicDepthBuffer: true }}
-          shadows="percentage"
+          gl={glFactory as any}
+          shadows
         >
-          <color attach="background" args={["#0a0a0a"]} />
-          <ambientLight intensity={0.4} />
-          <directionalLight
-            position={[50, 100, 50]}
-            intensity={1.5}
-            castShadow
-            shadow-mapSize={[2048, 2048]}
-            shadow-bias={-0.0001}
-          />
-          <Environment preset="studio" />
+          {/* Imported integration: environment + post-processing */}
+          <WebgpuGridIntegration unitScale={1000} />
 
-          <Physics gravity={[0, -9810, 0]}>
-            {debugSettings.physicsLines && <RapierDebugLines />}
-            {/* Ground collider (scene units are mm) */}
-            <RigidBody type="fixed" friction={1.2} restitution={0.05}>
-              <CuboidCollider args={[50000, 50, 50000]} position={[0, -50, 0]} />
-            </RigidBody>
+          {params.viewMode === "flight_sim" ? (
+            rapier ? (
+              <rapier.Physics gravity={[0, -9810, 0]}>
+                {debugSettings.physicsLines && (
+                  <Suspense fallback={null}>
+                    <LazyRapierDebugLines />
+                  </Suspense>
+                )}
+                {/* Ground collider (scene units are mm) */}
+                <rapier.RigidBody type="fixed" friction={1.2} restitution={0.05}>
+                  <rapier.CuboidCollider
+                    args={[50000, 50, 50000]}
+                    position={[0, -50, 0]}
+                  />
+                </rapier.RigidBody>
 
+                <DroneModel
+                  params={params}
+                  viewSettings={viewSettings}
+                  simSettings={simSettings}
+                  groupRef={groupRef}
+                  flightTelemetryRef={flightTelemetryRef}
+                  rapier={{
+                    RigidBody: rapier.RigidBody,
+                    CuboidCollider: rapier.CuboidCollider,
+                  }}
+                  waypoints={waypoints}
+                  isFlyingPath={isFlyingPath}
+                  onFlightComplete={() => setIsFlyingPath(false)}
+                  controlSensitivity={controlSensitivity}
+                />
+
+                <mesh
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  position={[0, 0, 0]}
+                  visible={false}
+                  onPointerDown={(e) => {
+                    if (!isFlyingPath) {
+                      setWaypoints([...waypoints, e.point]);
+                    }
+                  }}
+                >
+                  <planeGeometry args={[2000, 2000]} />
+                  <meshBasicMaterial />
+                </mesh>
+
+                {waypoints.length > 0 && (
+                  <group>
+                    {waypoints.length > 1 && (
+                      <primitive object={flightPathLine} dispose={null} />
+                    )}
+                    {waypoints.map((wp, i) => (
+                      <mesh
+                        key={i}
+                        position={[wp.x, Math.max(wp.y + 20, 20), wp.z]}
+                      >
+                        <sphereGeometry args={[3, 16, 16]} />
+                        <meshStandardMaterial
+                          color={i === 0 ? "#ffffff" : "#10b981"}
+                        />
+                      </mesh>
+                    ))}
+                  </group>
+                )}
+              </rapier.Physics>
+            ) : (
+              // Rapier is still loading; show the model immediately.
+              <DroneModel
+                params={params}
+                viewSettings={viewSettings}
+                simSettings={simSettings}
+                groupRef={groupRef}
+                flightTelemetryRef={flightTelemetryRef}
+                waypoints={waypoints}
+                isFlyingPath={isFlyingPath}
+                onFlightComplete={() => setIsFlyingPath(false)}
+                controlSensitivity={controlSensitivity}
+              />
+            )
+          ) : (
             <DroneModel
               params={params}
               viewSettings={viewSettings}
@@ -816,65 +1104,16 @@ export default function App() {
               onFlightComplete={() => setIsFlyingPath(false)}
               controlSensitivity={controlSensitivity}
             />
+          )}
 
-            {params.viewMode === "flight_sim" && (
-              <mesh
-                rotation={[-Math.PI / 2, 0, 0]}
-                position={[0, 0, 0]}
-                visible={false}
-                onPointerDown={(e) => {
-                  if (!isFlyingPath) {
-                    setWaypoints([...waypoints, e.point]);
-                  }
-                }}
-              >
-                <planeGeometry args={[2000, 2000]} />
-                <meshBasicMaterial />
-              </mesh>
-            )}
-
-            {waypoints.length > 0 && params.viewMode === "flight_sim" && (
-              <group>
-                {waypoints.length > 1 && (
-                  <primitive object={flightPathLine} dispose={null} />
-                )}
-                {waypoints.map((wp, i) => (
-                  <mesh
-                    key={i}
-                    position={[wp.x, Math.max(wp.y + 20, 20), wp.z]}
-                  >
-                    <sphereGeometry args={[3, 16, 16]} />
-                    <meshStandardMaterial
-                      color={i === 0 ? "#ffffff" : "#10b981"}
-                    />
-                  </mesh>
-                ))}
-              </group>
-            )}
-
-          </Physics>
-
-          <ContactShadows
-            position={[0, -0.1, 0]}
-            opacity={0.4}
-            scale={300}
-            blur={2}
-            far={50}
-          />
-
-          <Grid
-            infiniteGrid
-            fadeDistance={400}
-            sectionColor="#333"
-            cellColor="#1a1a1a"
-            position={[0, -0.2, 0]}
-          />
           <OrbitControls
             makeDefault
-            minPolarAngle={0}
-            maxPolarAngle={Math.PI / 2 + 0.1}
-            target={[0, 10, 0]}
-            maxDistance={50000}
+            enableDamping
+            dampingFactor={0.08}
+            maxPolarAngle={Math.PI * 0.48}
+            minDistance={500}
+            maxDistance={130000}
+            target={[0, 180, 0]}
           />
         </Canvas>
       </main>

@@ -27,6 +27,7 @@
     "react-dom": "^19.0.0",
     "three": "^0.183.1",
     "three-bvh-csg": "^0.0.18",
+    "webgpu-grid": "link:../webgpu-grid",
     "vite": "^6.2.0"
   },
   "devDependencies": {

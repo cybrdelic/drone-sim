@@ -43,6 +43,12 @@ export interface FlightTelemetry {
   tw: number;
   altitudeM: number;
   speedMS: number;
+  airspeedMS?: number;
+  windMS?: number;
+  groundEffectMult?: number;
+  batteryV?: number;
+  batteryI?: number;
+  armed?: boolean;
 }
 
 export interface DroneParams {

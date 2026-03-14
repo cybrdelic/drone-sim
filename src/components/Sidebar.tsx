@@ -1,13 +1,13 @@
 import React, { useEffect, useState } from "react";
 import {
-  ComponentFocus,
-  ComponentVisibility,
-  DebugSettings,
-  DroneParams,
-  FlightTelemetry,
-  SimSettings,
-  ViewMode,
-  ViewSettings,
+    ComponentFocus,
+    ComponentVisibility,
+    DebugSettings,
+    DroneParams,
+    FlightTelemetry,
+    SimSettings,
+    ViewMode,
+    ViewSettings,
 } from "../types";
 
 interface SidebarProps {
@@ -493,6 +493,31 @@ export function Sidebar({
                   <div className="text-neutral-500">SPD</div>
                   <div className="text-right">
                     {(flightTelemetry?.speedMS ?? 0).toFixed(2)} m/s
+                  </div>
+
+                  <div className="text-neutral-500">AIRS</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.airspeedMS ?? 0).toFixed(2)} m/s
+                  </div>
+
+                  <div className="text-neutral-500">WIND</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.windMS ?? 0).toFixed(2)} m/s
+                  </div>
+
+                  <div className="text-neutral-500">GE</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.groundEffectMult ?? 1).toFixed(2)}×
+                  </div>
+
+                  <div className="text-neutral-500">BAT</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.batteryV ?? 0).toFixed(2)} V
+                  </div>
+
+                  <div className="text-neutral-500">CUR</div>
+                  <div className="text-right">
+                    {(flightTelemetry?.batteryI ?? 0).toFixed(1)} A
                   </div>
                 </div>
               )}

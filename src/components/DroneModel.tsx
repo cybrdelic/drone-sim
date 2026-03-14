@@ -1,6 +1,5 @@
 import { Html } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
-import { CuboidCollider, RapierRigidBody, RigidBody } from "@react-three/rapier";
 import React, { useDeferredValue, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { ADDITION, Brush, Evaluator, SUBTRACTION } from "three-bvh-csg";
@@ -224,6 +223,10 @@ interface DroneModelProps {
   simSettings?: SimSettings;
   groupRef: React.RefObject<THREE.Group | null>;
   flightTelemetryRef?: React.MutableRefObject<FlightTelemetry>;
+  rapier?: {
+    RigidBody: React.ComponentType<any>;
+    CuboidCollider: React.ComponentType<any>;
+  };
   waypoints?: THREE.Vector3[];
   isFlyingPath?: boolean;
   onFlightComplete?: () => void;
@@ -236,6 +239,7 @@ export function DroneModel({
   simSettings,
   groupRef,
   flightTelemetryRef,
+  rapier,
   waypoints = [],
   isFlyingPath = false,
   onFlightComplete,
@@ -282,7 +286,7 @@ export function DroneModel({
 
   const propGroupRefs = useRef<Array<THREE.Group | null>>([]);
   const propSpinRad = useRef<number[]>([0, 0, 0, 0]);
-  const flightBodyRef = useRef<RapierRigidBody | null>(null);
+  const flightBodyRef = useRef<any>(null);
   const flightInitDone = useRef(false);
 
   const visualJitterRef = useRef<THREE.Group | null>(null);
@@ -792,9 +796,9 @@ export function DroneModel({
   const explodeBatteryY = exploded ? 48 : 0;
   const explodeTpuY = exploded ? 34 : 0;
 
-  // Physics should be enabled in all modes except exploded + print layout.
-  // Exploded is intentionally non-physical; print layout is a CAD layout view.
-  const physicsEnabled = viewMode !== "exploded" && viewMode !== "print_layout";
+  // For fast startup, keep non-flight modes non-physical.
+  // Flight sim is the only mode that needs Rapier + rigid-body integration.
+  const physicsEnabled = viewMode === "flight_sim";
 
   // Coarse single-body collider for assembled/clearance views.
   const assemblyHalfExtents: [number, number, number] = [
@@ -827,6 +831,13 @@ export function DroneModel({
   });
 
   const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const clamp11 = (v: number) => Math.max(-1, Math.min(1, v));
+  const applyDeadzone = (x: number, dz: number) => {
+    const ax = Math.abs(x);
+    if (ax <= dz) return 0;
+    const t = (ax - dz) / (1 - dz);
+    return Math.sign(x) * t;
+  };
 
   React.useEffect(() => {
     // Wireframe toggle for all materials (including inline materials).
@@ -1519,25 +1530,63 @@ export function DroneModel({
       } else {
         // Manual: throttle around hover + stick input
         const sens = THREE.MathUtils.clamp(controlSensitivity, 0.2, 1);
-        const throttleDelta = (keys.current.space ? 1 : 0) - (keys.current.shift ? 1 : 0);
+        // Gamepad (Nacon/XInput): use browser Gamepad API, fallback to keyboard.
+        // Default mapping:
+        // - Left stick Y: throttle (up = more)
+        // - Left stick X: yaw
+        // - Right stick Y: pitch (up = pitch forward)
+        // - Right stick X: roll
+        // This keeps keyboard behavior intact, and makes arming seamless (auto-arms on throttle).
+        let gpThrottle = 0;
+        let gpYaw = 0;
+        let gpPitch = 0;
+        let gpRoll = 0;
+        try {
+          const pads = typeof navigator !== "undefined" && navigator.getGamepads
+            ? navigator.getGamepads()
+            : [];
+          const gp = Array.from(pads).find((p) => p && p.connected && (p.mapping === "standard" || typeof p.mapping === "string"));
+          if (gp) {
+            const dz = 0.12;
+            const lsx = applyDeadzone(gp.axes?.[0] ?? 0, dz);
+            const lsy = applyDeadzone(gp.axes?.[1] ?? 0, dz);
+            const rsx = applyDeadzone(gp.axes?.[2] ?? 0, dz);
+            const rsy = applyDeadzone(gp.axes?.[3] ?? 0, dz);
+
+            gpYaw = clamp11(lsx);
+            gpThrottle = clamp11(-lsy);
+            gpRoll = clamp11(rsx);
+            gpPitch = clamp11(-rsy);
+          }
+        } catch {
+          // ignore
+        }
+
+        const kbThrottleDelta = (keys.current.space ? 1 : 0) - (keys.current.shift ? 1 : 0);
+        const throttleInput = clamp11(kbThrottleDelta + gpThrottle);
+
         // Start on the ground with motors off until the user commands throttle-up.
+        // (Realistic "arming" concept still exists, but it's automatic so you don't think about it.)
         if (!s.armed) {
-          if (throttleDelta > 0) s.armed = true;
+          if (throttleInput > 0.05) s.armed = true;
           throttleCmd01 = 0;
           desiredRateBody.set(0, 0, 0);
         } else {
           // Neutral throttle aims for hover, but small modeling biases can create a slow climb/sink.
           // Add a light vertical-velocity damper when the user is not actively commanding throttle.
           const kVzDamp = 0.045; // throttle fraction per (m/s) vertical speed
-          const vzDamp = throttleDelta === 0
+          const vzDamp = Math.abs(throttleInput) < 1e-3
             ? THREE.MathUtils.clamp(-s.velM.y * kVzDamp, -0.08, 0.08)
             : 0;
-          const targetThrottle = hoverThrottle01 + throttleDelta * (0.18 * sens) + vzDamp;
+          const targetThrottle = hoverThrottle01 + throttleInput * (0.18 * sens) + vzDamp;
           throttleCmd01 = clamp01(targetThrottle);
 
-        const pitchCmd = (keys.current.s ? 1 : 0) - (keys.current.w ? 1 : 0);
-        const rollCmd = (keys.current.a ? 1 : 0) - (keys.current.d ? 1 : 0);
-        const yawCmd = (keys.current.q ? 1 : 0) - (keys.current.e ? 1 : 0);
+        const pitchCmd =
+          clamp11(((keys.current.s ? 1 : 0) - (keys.current.w ? 1 : 0)) + gpPitch);
+        const rollCmd =
+          clamp11(((keys.current.a ? 1 : 0) - (keys.current.d ? 1 : 0)) + gpRoll);
+        const yawCmd =
+          clamp11(((keys.current.q ? 1 : 0) - (keys.current.e ? 1 : 0)) + gpYaw);
 
         const maxPitchRate = 2.2 * sens;
         const maxRollRate = 2.6 * sens;
@@ -1774,41 +1823,65 @@ export function DroneModel({
       // Net force in world (gravity is handled by Rapier).
       const thrustWorld = Fbody.clone().applyQuaternion(s.quat);
 
+      // Height above ground (AGL) of the collider bottom.
+      const colliderLocalY = assemblyColliderCenterY - massProps.comMm.y; // mm
+      const bottomAGLM =
+        s.posM.y + (colliderLocalY - assemblyHalfExtents[1]) * 1e-3;
+
+      let groundEffectMult = 1;
+      let windVelWorld = new THREE.Vector3(0, 0, 0);
+      let airspeedMS = s.velM.length();
+
       // Ground effect: thrust augmentation when altitude < 1 rotor diameter.
       // Based on Cheeseman & Bennett (1955): T_ge/T = 1 / (1 - (R/(4*z))^2)
       // where z = altitude, R = rotor radius.
       {
         const rotorR = (propSize * 25.4 / 2) * 1e-3; // prop radius in meters
-        const z = Math.max(0.01, s.posM.y); // altitude in meters
-        if (z < rotorR * 2) {
-          const ratio = rotorR / (4 * z);
-          const geMultiplier = 1 / Math.max(0.5, 1 - ratio * ratio);
-          // Only augment the vertical component
-          thrustWorld.y *= THREE.MathUtils.clamp(geMultiplier, 1.0, 1.4);
+        const thrustDir =
+          thrustWorld.lengthSq() > 1e-9
+            ? thrustWorld.clone().normalize()
+            : new THREE.Vector3(0, 1, 0);
+
+        // Effective height measured along the thrust axis (simple tilt correction).
+        const cosTilt = THREE.MathUtils.clamp(thrustDir.y, 0.2, 1);
+        const zAxis = Math.max(0.01, Math.max(0, bottomAGLM) / cosTilt);
+
+        // Only apply ground effect when the rotors are actually producing airflow.
+        if (s.armed && thrustWorld.lengthSq() > 1e-8 && zAxis < rotorR * 2) {
+          const ratio = rotorR / (4 * zAxis);
+          groundEffectMult = 1 / Math.max(0.5, 1 - ratio * ratio);
+          groundEffectMult = THREE.MathUtils.clamp(groundEffectMult, 1.0, 1.4);
+
+          // Apply along the thrust axis for more realistic behavior when tilted.
+          thrustWorld.multiplyScalar(groundEffectMult);
         }
       }
 
-      // Quadratic aerodynamic drag (parasitic + induced)
-      const CdA = (frameSize / 210) * 0.012; // parasitic drag area
-      const v = s.velM;
-      const speed = v.length();
-      const dragWorld = speed > 1e-6
-        ? v.clone().multiplyScalar(-0.5 * rho * CdA * speed)
-        : new THREE.Vector3(0, 0, 0);
-
-      // Simple wind model: light random gusts that slowly vary
+      // Wind model (m/s): light gusts that slowly vary.
       {
-        if (!s.windPhase) s.windPhase = [Math.random() * 100, Math.random() * 100, Math.random() * 100];
+        if (!s.windPhase)
+          s.windPhase = [Math.random() * 100, Math.random() * 100, Math.random() * 100];
         const windT = (s.windTime ?? 0) + dt;
         s.windTime = windT;
+
         // Perlin-like smooth wind using sin of different frequencies
-        const wx = 0.12 * Math.sin(windT * 0.4 + s.windPhase[0]) + 0.06 * Math.sin(windT * 1.1 + 7);
-        const wz = 0.12 * Math.sin(windT * 0.35 + s.windPhase[2]) + 0.06 * Math.sin(windT * 0.9 + 3);
-        // Scale wind force with altitude (ground shielding below ~0.5m)
-        const altFactor = THREE.MathUtils.smoothstep(s.posM.y, 0, 0.5);
-        const windForceN = new THREE.Vector3(wx * altFactor, 0, wz * altFactor);
-        dragWorld.add(windForceN);
+        const wx = 0.12 * Math.sin(windT * 0.4 + s.windPhase[0]) +
+          0.06 * Math.sin(windT * 1.1 + 7);
+        const wz = 0.12 * Math.sin(windT * 0.35 + s.windPhase[2]) +
+          0.06 * Math.sin(windT * 0.9 + 3);
+
+        // Shield wind close to the ground (AGL).
+        const altFactor = THREE.MathUtils.smoothstep(Math.max(0, bottomAGLM), 0, 1.5);
+        windVelWorld = new THREE.Vector3(wx * altFactor, 0, wz * altFactor);
       }
+
+      // Quadratic aerodynamic drag from RELATIVE airspeed: v_rel = v - wind.
+      const CdA = (frameSize / 210) * 0.012; // parasitic drag area
+      const vRel = s.velM.clone().sub(windVelWorld);
+      airspeedMS = vRel.length();
+      const dragWorld = airspeedMS > 1e-6
+        ? vRel.clone().multiplyScalar(-0.5 * rho * CdA * airspeedMS)
+        : new THREE.Vector3(0, 0, 0);
 
       // Apply forces/torques to Rapier.
       // Rapier world uses mm, so: 1 N -> 1000 (kg*mm/s^2), 1 N*m -> 1e6 (kg*mm^2/s^2)
@@ -1844,10 +1917,6 @@ export function DroneModel({
           const weightN = massKg * g;
           const thrustN = Math.max(0, thrustWorld.y);
           const tw = weightN > 1e-6 ? thrustN / weightN : 0;
-          // Report altitude as height above ground (AGL) of the collider bottom.
-          const colliderLocalY = assemblyColliderCenterY - massProps.comMm.y; // mm
-          const bottomAGLM =
-            s.posM.y + (colliderLocalY - assemblyHalfExtents[1]) * 1e-3;
           flightTelemetryRef.current = {
             throttle01: s.throttle01,
             thrustN,
@@ -1855,6 +1924,12 @@ export function DroneModel({
             tw,
             altitudeM: Math.max(0, bottomAGLM),
             speedMS: s.velM.length(),
+            airspeedMS,
+            windMS: windVelWorld.length(),
+            groundEffectMult,
+            batteryV: s.batteryV,
+            batteryI: s.batteryI,
+            armed: s.armed,
           };
         }
       }
@@ -2699,37 +2774,51 @@ export function DroneModel({
     </group>
   );
 
-  return physicsEnabled ? (
-    <RigidBody
-      type="dynamic"
-      colliders={false}
-      ref={viewMode === "flight_sim" ? flightBodyRef : undefined}
-      canSleep={true}
-      mass={massProps.massKg}
-      friction={1.1}
-      restitution={0.05}
-      linearDamping={viewMode === "flight_sim" ? 0.01 : 2.2}
-      angularDamping={viewMode === "flight_sim" ? 0.01 : 2.2}
-      gravityScale={1}
-      position={[0, viewMode === "flight_sim" ? flightSpawnLiftY : assemblySpawnLiftY, 0]}
-    >
-      <CuboidCollider
-        density={viewMode === "flight_sim" ? colliderDensity : 1e-6}
-        args={assemblyHalfExtents}
-        position={
-          viewMode === "flight_sim"
-            ? [
-                flightColliderOffset[0],
-                assemblyColliderCenterY + flightColliderOffset[1],
-                flightColliderOffset[2],
-              ]
-            : [0, assemblyColliderCenterY, 0]
-        }
+  if (physicsEnabled) {
+    const RigidBody = rapier?.RigidBody;
+    const CuboidCollider = rapier?.CuboidCollider;
+
+    // If physics is requested but Rapier isn't loaded yet, still show the visual model.
+    // (App will load Rapier on-demand and re-render with physics enabled.)
+    if (!RigidBody || !CuboidCollider) {
+      return <group position={[0, flightSpawnLiftY, 0]}>{droneVisual}</group>;
+    }
+
+    return (
+      <RigidBody
+        type="dynamic"
+        colliders={false}
+        ref={flightBodyRef}
+        canSleep={true}
+        mass={massProps.massKg}
         friction={1.1}
         restitution={0.05}
-      />
-      {droneVisual}
-    </RigidBody>
+        linearDamping={0.01}
+        angularDamping={0.01}
+        gravityScale={1}
+        position={[0, flightSpawnLiftY, 0]}
+      >
+        <CuboidCollider
+          density={colliderDensity}
+          args={assemblyHalfExtents}
+          position={[
+            flightColliderOffset[0],
+            assemblyColliderCenterY + flightColliderOffset[1],
+            flightColliderOffset[2],
+          ]}
+          friction={1.1}
+          restitution={0.05}
+        />
+        {droneVisual}
+      </RigidBody>
+    );
+  }
+
+  // Preserve the previous assembled/clearance world placement (which used to come
+  // from the rigid-body translation) without pulling Rapier into those modes.
+  const needsStaticLift = viewMode !== "exploded" && viewMode !== "print_layout";
+  return needsStaticLift ? (
+    <group position={[0, assemblySpawnLiftY, 0]}>{droneVisual}</group>
   ) : (
     droneVisual
   );

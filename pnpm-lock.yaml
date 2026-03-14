@@ -56,6 +56,9 @@ importers:
       vite:
         specifier: ^6.2.0
         version: 6.4.1(@types/node@22.19.13)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)
+      webgpu-grid:
+        specifier: link:../webgpu-grid
+        version: link:../webgpu-grid
     devDependencies:
       '@types/express':
         specifier: ^4.17.21
