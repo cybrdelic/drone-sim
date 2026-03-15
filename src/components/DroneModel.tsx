@@ -1,178 +1,9 @@
 import { Html } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
-import React, { useDeferredValue, useMemo, useRef } from "react";
+import React, { memo, useDeferredValue, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { ADDITION, Brush, Evaluator, SUBTRACTION } from "three-bvh-csg";
 import { DroneParams, FlightTelemetry, SimSettings, ViewSettings } from "../types";
-
-function forEachTriangle(
-  geometry: THREE.BufferGeometry,
-  cb: (a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3) => void,
-) {
-  const posAttr = geometry.getAttribute("position");
-  if (!posAttr) return;
-  const indexAttr = geometry.getIndex();
-
-  const a = new THREE.Vector3();
-  const b = new THREE.Vector3();
-  const c = new THREE.Vector3();
-
-  if (indexAttr) {
-    for (let i = 0; i < indexAttr.count; i += 3) {
-      const ia = indexAttr.getX(i);
-      const ib = indexAttr.getX(i + 1);
-      const ic = indexAttr.getX(i + 2);
-
-      a.fromBufferAttribute(posAttr, ia);
-      b.fromBufferAttribute(posAttr, ib);
-      c.fromBufferAttribute(posAttr, ic);
-      cb(a, b, c);
-    }
-    return;
-  }
-
-  for (let i = 0; i < posAttr.count; i += 3) {
-    a.fromBufferAttribute(posAttr, i);
-    b.fromBufferAttribute(posAttr, i + 1);
-    c.fromBufferAttribute(posAttr, i + 2);
-    cb(a, b, c);
-  }
-}
-
-function computePolyMassPropsMm(
-  geometry: THREE.BufferGeometry,
-  densityKgM3: number,
-) {
-  // Computes volume/COM/inertia from a closed triangle mesh by summing signed tetrahedra (0,a,b,c).
-  // Geometry coordinates are assumed to be in millimeters.
-  const mmToM = 1e-3;
-
-  let signedVolumeM3 = 0;
-  const centroidTimesVolM4 = new THREE.Vector3(0, 0, 0);
-
-  let intX2 = 0;
-  let intY2 = 0;
-  let intZ2 = 0;
-  let intXY = 0;
-  let intYZ = 0;
-  let intZX = 0;
-
-  forEachTriangle(geometry, (aMm, bMm, cMm) => {
-    const ax = aMm.x * mmToM;
-    const ay = aMm.y * mmToM;
-    const az = aMm.z * mmToM;
-    const bx = bMm.x * mmToM;
-    const by = bMm.y * mmToM;
-    const bz = bMm.z * mmToM;
-    const cx = cMm.x * mmToM;
-    const cy = cMm.y * mmToM;
-    const cz = cMm.z * mmToM;
-
-    const crossBxCx = by * cz - bz * cy;
-    const crossByCy = bz * cx - bx * cz;
-    const crossBzCz = bx * cy - by * cx;
-    const v6 = ax * crossBxCx + ay * crossByCy + az * crossBzCz;
-    const v = v6 / 6;
-    if (!Number.isFinite(v) || Math.abs(v) < 1e-18) return;
-
-    signedVolumeM3 += v;
-    centroidTimesVolM4.x += (ax + bx + cx) * (v / 4);
-    centroidTimesVolM4.y += (ay + by + cy) * (v / 4);
-    centroidTimesVolM4.z += (az + bz + cz) * (v / 4);
-
-    const f1 = (p: number, q: number, r: number) =>
-      p * p + q * q + r * r + p * q + q * r + r * p;
-    const f2 = (
-      px: number,
-      py: number,
-      qx: number,
-      qy: number,
-      rx: number,
-      ry: number,
-    ) =>
-      2 * (px * py + qx * qy + rx * ry) +
-      (px * qy + py * qx) +
-      (px * ry + py * rx) +
-      (qx * ry + qy * rx);
-
-    intX2 += (v / 10) * f1(ax, bx, cx);
-    intY2 += (v / 10) * f1(ay, by, cy);
-    intZ2 += (v / 10) * f1(az, bz, cz);
-    intXY += (v / 20) * f2(ax, ay, bx, by, cx, cy);
-    intYZ += (v / 20) * f2(ay, az, by, bz, cy, cz);
-    intZX += (v / 20) * f2(az, ax, bz, bx, cz, cx);
-  });
-
-  if (!Number.isFinite(signedVolumeM3) || Math.abs(signedVolumeM3) < 1e-18) {
-    return {
-      signedVolumeMm3: 0,
-      massKg: 0,
-      comMm: new THREE.Vector3(0, 0, 0),
-      inertiaKgM2_aboutCOM: new THREE.Matrix3().set(0, 0, 0, 0, 0, 0, 0, 0, 0),
-    };
-  }
-
-  const sign = signedVolumeM3 < 0 ? -1 : 1;
-  const volumeM3 = Math.abs(signedVolumeM3);
-  const massKg = volumeM3 * densityKgM3;
-  const comM = centroidTimesVolM4.clone().multiplyScalar(1 / signedVolumeM3);
-  const comMm = comM.clone().multiplyScalar(1 / mmToM);
-
-  const Ixx0 = sign * densityKgM3 * (intY2 + intZ2);
-  const Iyy0 = sign * densityKgM3 * (intX2 + intZ2);
-  const Izz0 = sign * densityKgM3 * (intX2 + intY2);
-  const Ixy0 = -sign * densityKgM3 * intXY;
-  const Iyz0 = -sign * densityKgM3 * intYZ;
-  const Ixz0 = -sign * densityKgM3 * intZX;
-
-  const I0 = new THREE.Matrix3().set(
-    Ixx0,
-    Ixy0,
-    Ixz0,
-    Ixy0,
-    Iyy0,
-    Iyz0,
-    Ixz0,
-    Iyz0,
-    Izz0,
-  );
-
-  // Parallel-axis shift: inertia about COM.
-  const r2 = comM.lengthSq();
-  const rrT = new THREE.Matrix3().set(
-    comM.x * comM.x,
-    comM.x * comM.y,
-    comM.x * comM.z,
-    comM.y * comM.x,
-    comM.y * comM.y,
-    comM.y * comM.z,
-    comM.z * comM.x,
-    comM.z * comM.y,
-    comM.z * comM.z,
-  );
-  const I3 = new THREE.Matrix3().identity();
-  const shift = I3.multiplyScalar(r2);
-  {
-    const d = shift.elements;
-    const s = rrT.elements;
-    for (let i = 0; i < 9; i++) d[i] -= s[i];
-  }
-  shift.multiplyScalar(massKg);
-
-  const Icom = I0.clone();
-  {
-    const d = Icom.elements;
-    const s = shift.elements;
-    for (let i = 0; i < 9; i++) d[i] -= s[i];
-  }
-
-  return {
-    signedVolumeMm3: signedVolumeM3 / (mmToM * mmToM * mmToM),
-    massKg,
-    comMm,
-    inertiaKgM2_aboutCOM: Icom,
-  };
-}
 
 function boxInertiaDiagKgM2(massKg: number, sizeM: THREE.Vector3) {
   const x = sizeM.x;
@@ -223,6 +54,7 @@ interface DroneModelProps {
   simSettings?: SimSettings;
   groupRef: React.RefObject<THREE.Group | null>;
   flightTelemetryRef?: React.MutableRefObject<FlightTelemetry>;
+  resetToken?: number;
   rapier?: {
     RigidBody: React.ComponentType<any>;
     CuboidCollider: React.ComponentType<any>;
@@ -233,12 +65,13 @@ interface DroneModelProps {
   controlSensitivity?: number;
 }
 
-export function DroneModel({
+export const DroneModel = memo(function DroneModel({
   params,
   viewSettings,
   simSettings,
   groupRef,
   flightTelemetryRef,
+  resetToken = 0,
   rapier,
   waypoints = [],
   isFlyingPath = false,
@@ -761,23 +594,30 @@ export function DroneModel({
     return results;
   }, [viewMode, propSize, motorPositions, fcMounting, armWidth]);
 
-  const bottomPlateTopY = useMemo(() => {
-    bottomPlateGeo.computeBoundingBox();
-    const bb = bottomPlateGeo.boundingBox;
-    return bb ? bb.max.y : plateThickness;
-  }, [bottomPlateGeo, plateThickness]);
-
-  const bottomPlateMinY = useMemo(() => {
-    bottomPlateGeo.computeBoundingBox();
-    const bb = bottomPlateGeo.boundingBox;
-    return bb ? bb.min.y : -plateThickness;
-  }, [bottomPlateGeo, plateThickness]);
-
-  const topPlateTopY = useMemo(() => {
-    topPlateGeo.computeBoundingBox();
-    const bb = topPlateGeo.boundingBox;
-    return bb ? bb.max.y : topPlateThickness;
-  }, [topPlateGeo, topPlateThickness]);
+  const bottomPlateTopY = plateThickness;
+  const bottomPlateMinY = 0;
+  const topPlateTopY = topPlateThickness;
+  const centerRadius = fcMounting / 2 + 10;
+  const motorPadRadius = motorMountPattern / 2 + 3.5;
+  const bottomPlateSpan = Math.SQRT1_2 * frameSize + motorPadRadius * 2 + 12;
+  const topPlateWidth = fcMounting + 12;
+  const topPlateDepth = fcMounting + 30;
+  const carbonSheetSize = Math.max(
+    300,
+    Math.ceil(bottomPlateSpan + topPlateWidth + 72),
+  );
+  const tpuBedSize = 220;
+  const layoutZoneGap = 88;
+  const carbonSheetCenterX = -(tpuBedSize + layoutZoneGap) / 2;
+  const tpuBedCenterX = carbonSheetSize / 2 + layoutZoneGap / 2;
+  const carbonBottomX =
+    carbonSheetCenterX - carbonSheetSize / 2 + bottomPlateSpan / 2 + 18;
+  const carbonTopX =
+    carbonSheetCenterX + carbonSheetSize / 2 - topPlateWidth / 2 - 18;
+  const printSurfaceY = -0.35;
+  const printGuideLineThickness = 1.2;
+  const printGuideLineHeight = 0.6;
+  const isPrintLayout = viewMode === "print_layout";
 
   // Layout Logic based on viewMode
   let bottomPos: [number, number, number] = [0, 0, 0];
@@ -813,9 +653,9 @@ export function DroneModel({
     topPos = [0, bottomPlateTopY + standoffHeight + 30, 0];
     standoffY = bottomPlateTopY + standoffHeight / 2 + 15;
   } else if (viewMode === "print_layout") {
-    bottomPos = [0, 0, 0];
-    topPos = [fcMounting + 40, 0, 0]; // Place next to bottom plate
-    showStandoffs = false; // Don't print aluminum standoffs
+    bottomPos = [carbonBottomX, 0, 0];
+    topPos = [carbonTopX, 0, 0];
+    showStandoffs = false;
   }
 
   // Flight Simulator Logic
@@ -941,10 +781,79 @@ export function DroneModel({
   const massProps = useMemo(() => {
     const mmToM = 1e-3;
     const carbonDensityKgM3 = 1600;
+    const mm3ToM3 = 1e-9;
+    const centerRadius = fcMounting / 2 + 10;
+    const armLength = frameSize / 2;
+    const motorPadRadius = motorMountPattern / 2 + 3.5;
+    const screwHoleRadius = motorMountPattern >= 16 ? 1.6 : 1.1;
+    const fcHoleRadius = 1.6;
+    const topPlateWidthMm = fcMounting + 12;
+    const topPlateDepthMm = fcMounting + 30;
+    const topCornerRadiusMm = 6;
 
-    // Plate mass properties from the actual generated CAD triangle meshes.
-    const bottomPlate = computePolyMassPropsMm(bottomPlateGeo, carbonDensityKgM3);
-    const topPlate = computePolyMassPropsMm(topPlateGeo, carbonDensityKgM3);
+    const centerAreaMm2 = Math.PI * centerRadius * centerRadius;
+    const armAreaMm2 = 4 * armWidth * armLength * 0.82;
+    const motorPadAreaMm2 = 4 * Math.PI * motorPadRadius * motorPadRadius;
+    const fcHolesAreaMm2 = 4 * Math.PI * fcHoleRadius * fcHoleRadius;
+    const motorHolesAreaMm2 =
+      4 * Math.PI * Math.pow(motorCenterHole / 2, 2) +
+      16 * Math.PI * screwHoleRadius * screwHoleRadius;
+    const cutoutWidthMm = armWidth * (weightReduction / 100) * 0.7;
+    const cutoutLengthMm = armLength * 0.5;
+    const cutoutAreaMm2 =
+      weightReduction > 0 && cutoutWidthMm > 2
+        ? 4 * cutoutWidthMm * cutoutLengthMm * 0.72
+        : 0;
+
+    const bottomAreaMm2 = Math.max(
+      centerAreaMm2 + armAreaMm2 + motorPadAreaMm2 - fcHolesAreaMm2 - motorHolesAreaMm2 - cutoutAreaMm2,
+      centerAreaMm2,
+    );
+
+    const roundedRectAreaMm2 =
+      topPlateWidthMm * topPlateDepthMm -
+      (4 - Math.PI) * topCornerRadiusMm * topCornerRadiusMm;
+    const strapSlotAreaMm2 = 2 * 20 * 3;
+    const topAreaMm2 = Math.max(
+      roundedRectAreaMm2 - fcHolesAreaMm2 - strapSlotAreaMm2,
+      roundedRectAreaMm2 * 0.7,
+    );
+
+    const bottomMassKg = bottomAreaMm2 * plateThickness * mm3ToM3 * carbonDensityKgM3;
+    const topMassKg = topAreaMm2 * topPlateThickness * mm3ToM3 * carbonDensityKgM3;
+
+    const bottomPlate = {
+      massKg: bottomMassKg,
+      comMm: new THREE.Vector3(0, plateThickness / 2, 0),
+      inertiaKgM2_aboutCOM: (() => {
+        const bottomSpanMm = Math.SQRT1_2 * frameSize + motorPadRadius * 2;
+        const inertiaDiag = boxInertiaDiagKgM2(
+          bottomMassKg,
+          new THREE.Vector3(bottomSpanMm * mmToM, plateThickness * mmToM, bottomSpanMm * mmToM),
+        );
+        return new THREE.Matrix3().set(
+          inertiaDiag.x, 0, 0,
+          0, inertiaDiag.y, 0,
+          0, 0, inertiaDiag.z,
+        );
+      })(),
+    };
+
+    const topPlate = {
+      massKg: topMassKg,
+      comMm: new THREE.Vector3(0, topPlateThickness / 2, 0),
+      inertiaKgM2_aboutCOM: (() => {
+        const inertiaDiag = boxInertiaDiagKgM2(
+          topMassKg,
+          new THREE.Vector3(topPlateWidthMm * mmToM, topPlateThickness * mmToM, topPlateDepthMm * mmToM),
+        );
+        return new THREE.Matrix3().set(
+          inertiaDiag.x, 0, 0,
+          0, inertiaDiag.y, 0,
+          0, 0, inertiaDiag.z,
+        );
+      })(),
+    };
 
     // Assembled offsets (mm)
     const bottomOffsetMm = new THREE.Vector3(0, 0, 0);
@@ -1090,13 +999,17 @@ export function DroneModel({
       invInertiaKgM2,
     };
   }, [
-    bottomPlateGeo,
+    frameSize,
+    fcMounting,
+    motorCenterHole,
+    motorMountPattern,
     motorPositions,
     plateThickness,
     propSize,
     standoffHeight,
-    topPlateGeo,
     topPlateThickness,
+    armWidth,
+    weightReduction,
   ]);
 
   const flightColliderOffset: [number, number, number] = [
@@ -1242,6 +1155,42 @@ export function DroneModel({
 
   const prevViewModeRef = useRef(viewMode);
 
+  const resetFlightState = React.useCallback(() => {
+    flightInitDone.current = false;
+    flightState.current.posM.set(0, 0, 0);
+    flightState.current.velM.set(0, 0, 0);
+    flightState.current.omegaBody.set(0, 0, 0);
+    flightState.current.quat.identity();
+    flightState.current.armed = false;
+    flightState.current.motorOmegaRad = [0, 0, 0, 0];
+    flightState.current.motorTiltRad = [0, 0, 0, 0];
+    flightState.current.motorPhaseRad = [0, 0, 0, 0];
+    flightState.current.batteryV = propulsion.batteryCells * propulsion.vOpenPerCell;
+    flightState.current.batteryI = 0;
+    flightState.current.throttle01 = 0;
+    flightState.current.targetWpIndex = 1;
+    flightState.current.rng = 123456789;
+    flightState.current.windPhase = null;
+    flightState.current.windTime = 0;
+
+    if (flightTelemetryRef) {
+      flightTelemetryRef.current = {
+        throttle01: 0,
+        thrustN: 0,
+        weightN: 0,
+        tw: 0,
+        altitudeM: 0,
+        speedMS: 0,
+        airspeedMS: 0,
+        windMS: 0,
+        groundEffectMult: 1,
+        batteryV: 0,
+        batteryI: 0,
+        armed: false,
+      };
+    }
+  }, [flightTelemetryRef, propulsion.batteryCells, propulsion.vOpenPerCell]);
+
   React.useEffect(() => {
     const prev = prevViewModeRef.current;
     prevViewModeRef.current = viewMode;
@@ -1249,46 +1198,23 @@ export function DroneModel({
     // Reset flight state when ENTERING flight sim.
     // This guarantees a consistent start: on the ground, not moving, motors disarmed.
     if (prev !== "flight_sim" && viewMode === "flight_sim") {
-      flightInitDone.current = false;
-      flightState.current.posM.set(0, 0, 0);
-      flightState.current.velM.set(0, 0, 0);
-      flightState.current.omegaBody.set(0, 0, 0);
-      flightState.current.quat.identity();
-      flightState.current.armed = false;
-      flightState.current.motorOmegaRad = [0, 0, 0, 0];
-      flightState.current.motorTiltRad = [0, 0, 0, 0];
-      flightState.current.motorPhaseRad = [0, 0, 0, 0];
-      flightState.current.batteryV = propulsion.batteryCells * propulsion.vOpenPerCell;
-      flightState.current.batteryI = 0;
-      flightState.current.throttle01 = 0;
-      flightState.current.targetWpIndex = 1;
-      flightState.current.rng = 123456789;
-      flightState.current.windPhase = null;
-      flightState.current.windTime = 0;
+      resetFlightState();
     }
 
     // Reset flight state when leaving flight sim or when a new flight starts.
     if (viewMode !== "flight_sim") {
-      flightState.current.posM.set(0, 0, 0);
-      flightState.current.velM.set(0, 0, 0);
-      flightState.current.omegaBody.set(0, 0, 0);
-      flightState.current.quat.identity();
-      flightState.current.armed = false;
-      flightState.current.motorOmegaRad = [0, 0, 0, 0];
-      flightState.current.motorTiltRad = [0, 0, 0, 0];
-      flightState.current.motorPhaseRad = [0, 0, 0, 0];
-      flightState.current.batteryV = propulsion.batteryCells * propulsion.vOpenPerCell;
-      flightState.current.batteryI = 0;
-      flightState.current.throttle01 = 0;
-      flightState.current.targetWpIndex = 1;
-      flightState.current.rng = 123456789;
-      flightState.current.windPhase = null;
-      flightState.current.windTime = 0;
+      resetFlightState();
     }
     if (!isFlyingPath) {
       flightState.current.targetWpIndex = 1;
     }
-  }, [viewMode, isFlyingPath, propulsion]);
+  }, [viewMode, isFlyingPath, resetFlightState]);
+
+  React.useEffect(() => {
+    if (viewMode === "flight_sim") {
+      resetFlightState();
+    }
+  }, [resetToken, resetFlightState, viewMode]);
 
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1582,9 +1508,9 @@ export function DroneModel({
           throttleCmd01 = clamp01(targetThrottle);
 
         const pitchCmd =
-          clamp11(((keys.current.s ? 1 : 0) - (keys.current.w ? 1 : 0)) + gpPitch);
+          clamp11(((keys.current.w ? 1 : 0) - (keys.current.s ? 1 : 0)) + gpPitch);
         const rollCmd =
-          clamp11(((keys.current.a ? 1 : 0) - (keys.current.d ? 1 : 0)) + gpRoll);
+          clamp11(((keys.current.d ? 1 : 0) - (keys.current.a ? 1 : 0)) + gpRoll);
         const yawCmd =
           clamp11(((keys.current.q ? 1 : 0) - (keys.current.e ? 1 : 0)) + gpYaw);
 
@@ -2029,7 +1955,14 @@ export function DroneModel({
     }
   });
 
-  const v = effectiveViewSettings.visibility;
+  const v = isPrintLayout
+    ? {
+        frame: true,
+        propulsion: false,
+        electronics: false,
+        accessories: showTPU,
+      }
+    : effectiveViewSettings.visibility;
   const droneVisual = (
     <group
       ref={groupRef}
@@ -2040,6 +1973,77 @@ export function DroneModel({
       }
     >
       <group ref={visualJitterRef}>
+      {isPrintLayout && (
+        <>
+          <group position={[carbonSheetCenterX, printSurfaceY, 0]}>
+            <mesh receiveShadow rotation={[-Math.PI / 2, 0, 0]}>
+              <planeGeometry args={[carbonSheetSize, carbonSheetSize]} />
+              <meshStandardMaterial
+                color="#0f172a"
+                transparent
+                opacity={0.16}
+                roughness={0.92}
+                metalness={0.04}
+              />
+            </mesh>
+            <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[
+                carbonSheetSize / 2 - printGuideLineThickness,
+                carbonSheetSize / 2,
+                4,
+              ]} />
+              <meshStandardMaterial color="#7dd3fc" transparent opacity={0.45} />
+            </mesh>
+            <mesh position={[0, printGuideLineHeight / 2, 0]}>
+              <boxGeometry args={[carbonSheetSize, printGuideLineHeight, printGuideLineThickness]} />
+              <meshStandardMaterial color="#7dd3fc" transparent opacity={0.18} />
+            </mesh>
+            <mesh position={[0, printGuideLineHeight / 2, 0]}>
+              <boxGeometry args={[printGuideLineThickness, printGuideLineHeight, carbonSheetSize]} />
+              <meshStandardMaterial color="#7dd3fc" transparent opacity={0.18} />
+            </mesh>
+            <Annotation
+              title="Carbon Cut Sheet"
+              description={`${carbonSheetSize}×${carbonSheetSize}mm stock • 2 parts nested`}
+              position={[0, 8, carbonSheetSize / 2 + 22]}
+            />
+          </group>
+
+          <group position={[tpuBedCenterX, printSurfaceY, 0]}>
+            <mesh receiveShadow rotation={[-Math.PI / 2, 0, 0]}>
+              <planeGeometry args={[tpuBedSize, tpuBedSize]} />
+              <meshStandardMaterial
+                color="#111827"
+                transparent
+                opacity={0.22}
+                roughness={0.96}
+                metalness={0.03}
+              />
+            </mesh>
+            <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[
+                tpuBedSize / 2 - printGuideLineThickness,
+                tpuBedSize / 2,
+                4,
+              ]} />
+              <meshStandardMaterial color="#34d399" transparent opacity={0.5} />
+            </mesh>
+            <mesh position={[0, printGuideLineHeight / 2, 0]}>
+              <boxGeometry args={[tpuBedSize, printGuideLineHeight, printGuideLineThickness]} />
+              <meshStandardMaterial color="#34d399" transparent opacity={0.2} />
+            </mesh>
+            <mesh position={[0, printGuideLineHeight / 2, 0]}>
+              <boxGeometry args={[printGuideLineThickness, printGuideLineHeight, tpuBedSize]} />
+              <meshStandardMaterial color="#34d399" transparent opacity={0.2} />
+            </mesh>
+            <Annotation
+              title="TPU Print Bed"
+              description={`${tpuBedSize}×${tpuBedSize}mm FDM envelope • accessories laid flat`}
+              position={[0, 8, tpuBedSize / 2 + 22]}
+            />
+          </group>
+        </>
+      )}
       {(viewMode === "exploded" || viewMode === "flight_sim") && (
         <group position={[0, bottomPlateTopY + 2, 0]}>
           <axesHelper args={[90]} />
@@ -2770,6 +2774,124 @@ export function DroneModel({
             })}
           </group>
         )}
+
+        {isPrintLayout && showTPU && (
+          <group>
+            <group position={[tpuBedCenterX, 1.2, 0]}>
+              <group position={[-62, 0, -58]}>
+                <mesh position={[-16, 1, 0]} material={tpuMaterial} castShadow receiveShadow>
+                  <boxGeometry args={[22, 2, 22]} />
+                </mesh>
+                <mesh position={[16, 1, 0]} material={tpuMaterial} castShadow receiveShadow>
+                  <boxGeometry args={[22, 2, 22]} />
+                </mesh>
+                <mesh position={[0, 1, 28]} material={tpuMaterial} castShadow receiveShadow>
+                  <boxGeometry args={[22, 2, 22]} />
+                </mesh>
+                <Annotation
+                  title="FPV Camera Cradle"
+                  description="3 TPU pieces • flat-packed for clean bridging"
+                  position={[0, 12, 28]}
+                />
+              </group>
+
+              <group position={[42, 0, -56]}>
+                <mesh position={[0, 2, 0]} castShadow receiveShadow material={tpuMaterial}>
+                  <boxGeometry args={[24, 4, 20]} />
+                </mesh>
+                <mesh position={[-18, 1.5, 0]} castShadow receiveShadow material={tpuMaterial}>
+                  <boxGeometry args={[16, 3, 15]} />
+                </mesh>
+                <mesh position={[18, 1.5, 0]} castShadow receiveShadow material={tpuMaterial}>
+                  <boxGeometry args={[16, 3, 15]} />
+                </mesh>
+                <mesh
+                  position={[-18, 1.5, 15]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  castShadow
+                  receiveShadow
+                  material={tpuMaterial}
+                >
+                  <cylinderGeometry args={[7.5, 7.5, 3, 16]} />
+                </mesh>
+                <mesh
+                  position={[18, 1.5, 15]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  castShadow
+                  receiveShadow
+                  material={tpuMaterial}
+                >
+                  <cylinderGeometry args={[7.5, 7.5, 3, 16]} />
+                </mesh>
+                <Annotation
+                  title="Action Cam Mount"
+                  description="Base, twin forks, 2 cam lugs separated for print"
+                  position={[0, 14, 16]}
+                />
+              </group>
+
+              <group position={[-56, 0, 26]}>
+                <mesh castShadow receiveShadow material={tpuMaterial}>
+                  <boxGeometry args={[20, 6, standoffHeight]} />
+                </mesh>
+                <mesh
+                  position={[0, 3, 28]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  castShadow
+                  receiveShadow
+                  material={tpuMaterial}
+                >
+                  <cylinderGeometry args={[3, 3, 20, 16]} />
+                </mesh>
+                <mesh
+                  position={[-12, 2.5, 4]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  castShadow
+                  receiveShadow
+                  material={tpuMaterial}
+                >
+                  <cylinderGeometry args={[2, 2, 30, 12]} />
+                </mesh>
+                <mesh
+                  position={[12, 2.5, 4]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  castShadow
+                  receiveShadow
+                  material={tpuMaterial}
+                >
+                  <cylinderGeometry args={[2, 2, 30, 12]} />
+                </mesh>
+                <Annotation
+                  title="Antenna Mount Pack"
+                  description="Rear bridge + VTX tube + 2 RX tubes laid flat"
+                  position={[0, 16, 32]}
+                />
+              </group>
+
+              {motorPositions.map((_, i) => {
+                const col = i % 2;
+                const row = Math.floor(i / 2);
+                return (
+                  <group
+                    key={`print-bumper-${i}`}
+                    position={[38 + col * 38, 2.5, 18 + row * 40]}
+                  >
+                    <mesh rotation={[Math.PI / 2, 0, 0]} castShadow receiveShadow material={tpuMaterial}>
+                      <torusGeometry
+                        args={[motorPadRadius + 1, 2.5, 12, 24, Math.PI * 1.2]}
+                      />
+                    </mesh>
+                  </group>
+                );
+              })}
+              <Annotation
+                title="Motor Bumpers"
+                description="4 TPU guards • spaced for separate cooling and cleanup"
+                position={[76, 14, 56]}
+              />
+            </group>
+          </group>
+        )}
       </group>
     </group>
   );
@@ -2822,4 +2944,6 @@ export function DroneModel({
   ) : (
     droneVisual
   );
-}
+});
+
+DroneModel.displayName = "DroneModel";

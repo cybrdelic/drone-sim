@@ -32,7 +32,7 @@ function ControlGroup({
 }) {
   return (
     <div className="mb-6">
-      <div className="text-[10px] font-bold text-neutral-500 mb-3 uppercase tracking-widest border-b border-neutral-800 pb-2">
+      <div className="kicker mb-3 border-b border-white/8 pb-2">
         {title}
       </div>
       <div className="flex flex-col gap-4">{children}</div>
@@ -79,10 +79,10 @@ function Slider({
   return (
     <div>
       <div className="flex justify-between items-end mb-1">
-        <label className="text-[11px] font-medium text-neutral-300">
+        <label className="ui-label">
           {label}
         </label>
-        <span className="text-[10px] font-mono text-emerald-400">
+        <span className="ui-value">
           {localValue.toFixed(step && step < 1 ? 1 : 0)}
           {unit}
         </span>
@@ -94,7 +94,7 @@ function Slider({
         step={step}
         value={localValue}
         onChange={(e) => setLocalValue(parseFloat(e.target.value))}
-        className="w-full h-1.5 bg-neutral-800 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-400 hover:[&::-webkit-slider-thumb]:bg-emerald-300"
+        className="ui-slider cursor-pointer"
       />
     </div>
   );
@@ -110,13 +110,13 @@ interface SelectProps {
 function Select({ label, value, options, onChange }: SelectProps) {
   return (
     <div>
-      <label className="text-[11px] font-medium text-neutral-300 block mb-1">
+      <label className="ui-label block mb-1.5">
         {label}
       </label>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-neutral-900 border border-neutral-700 text-neutral-200 text-xs p-2 rounded outline-none focus:border-emerald-500 transition-colors cursor-pointer"
+        className="ui-select cursor-pointer"
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>
@@ -139,12 +139,12 @@ function Checkbox({
 }) {
   return (
     <label className="flex items-center justify-between gap-3">
-      <span className="text-[11px] font-medium text-neutral-300">{label}</span>
+      <span className="ui-label">{label}</span>
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        className="h-4 w-4 accent-emerald-400"
+        className="ui-check"
       />
     </label>
   );
@@ -198,20 +198,29 @@ export function Sidebar({
   };
 
   return (
-    <div className="w-80 bg-[#111] text-neutral-100 flex flex-col h-full overflow-y-auto border-r border-neutral-800 z-10 select-none shadow-2xl">
-      <div className="p-6 border-b border-neutral-800 bg-[#0a0a0a]">
-        <h1 className="text-lg font-bold tracking-tight text-white">
-          AeroForge PRO
-        </h1>
-        <div className="text-[10px] font-mono text-emerald-500 mt-1 flex items-center gap-2">
-          <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-          PRODUCTION CAD ENGINE
+    <div className="etched-panel sidebar-shell text-neutral-100 select-none">
+      <div className="sidebar-head">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="kicker mb-1">Inspector</div>
+            <h1 className="text-[13px] font-semibold tracking-[0.01em] text-white">
+              Drone Sim
+            </h1>
+          </div>
+          <div className="text-[10px] text-white/55 uppercase tracking-[0.08em] pt-0.5">
+            Ready
+          </div>
+        </div>
+        <div className="sidebar-meta-row">
+          <span>{params.frameSize.toFixed(0)} mm</span>
+          <span>{params.propSize.toFixed(1)} in</span>
+          <span>{params.viewMode.replace("_", " ")}</span>
         </div>
       </div>
 
-      <div className="flex-1 p-6">
+      <div className="sidebar-body">
         <ControlGroup title="Workspace">
-          <div className="flex flex-wrap bg-neutral-900 rounded-lg p-1 border border-neutral-800 gap-1">
+          <div className="segment-wrap">
             {(
               [
                 "assembled",
@@ -224,10 +233,10 @@ export function Sidebar({
               <button
                 key={mode}
                 onClick={() => handleChange("viewMode", mode)}
-                className={`flex-1 min-w-[30%] py-2 text-[10px] uppercase tracking-wider font-medium rounded transition-all ${
+                className={`segment-chip ${
                   params.viewMode === mode
-                    ? "bg-neutral-700 text-white shadow-sm"
-                    : "text-neutral-500 hover:text-neutral-300"
+                    ? "segment-chip-active"
+                    : ""
                 }`}
               >
                 {mode.replace("_", " ")}
@@ -258,7 +267,7 @@ export function Sidebar({
             ]}
           />
 
-          <div className="grid grid-cols-1 gap-2">
+          <div className="sidebar-subsection grid grid-cols-1 gap-3">
             <Checkbox
               label="Frame"
               checked={viewSettings.visibility.frame}
@@ -458,20 +467,20 @@ export function Sidebar({
           />
 
           {effectiveDebugSettings.flightTelemetry && (
-            <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-[11px] font-mono text-neutral-300">
+            <div className="sidebar-subsection text-[11px] font-mono text-neutral-300">
               {params.viewMode !== "flight_sim" ? (
-                <div className="text-neutral-500">
+                <div className="text-white/55">
                   Switch to flight sim to view telemetry.
                 </div>
               ) : (
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-                  <div className="text-neutral-500">THR</div>
-                  <div className="text-right text-emerald-400">
+                  <div className="text-white/45">THR</div>
+                  <div className="text-right text-[#dbe8ff]">
                     {(flightTelemetry?.throttle01 ?? 0).toFixed(2)}
                   </div>
 
-                  <div className="text-neutral-500">T/W</div>
-                  <div className="text-right text-emerald-400">
+                  <div className="text-white/45">T/W</div>
+                  <div className="text-right text-[#dbe8ff]">
                     {(flightTelemetry?.tw ?? 0).toFixed(2)}
                   </div>
 
@@ -526,15 +535,17 @@ export function Sidebar({
         </ControlGroup>
       </div>
 
-      <div className="p-6 border-t border-neutral-800 bg-[#0a0a0a]">
+      <div className="sidebar-foot">
         <button
           onClick={onExport}
-          className="w-full py-3 bg-emerald-500 text-black text-[11px] font-bold uppercase tracking-widest rounded hover:bg-emerald-400 active:bg-emerald-600 transition-colors shadow-[0_0_15px_rgba(16,185,129,0.2)]"
+          className="ui-action"
         >
-          Export Production STL
+          {params.viewMode === "print_layout" ? "Export Print Pack STL" : "Export Production STL"}
         </button>
-        <p className="text-[9px] text-neutral-500 text-center mt-3">
-          Ready for CNC routing or 3D Printing
+        <p className="text-[9px] text-white/45 text-center mt-3 uppercase tracking-[0.14em]">
+          {params.viewMode === "print_layout"
+            ? "Print pack staged with hardware references"
+            : "Ready for CNC routing or 3D printing"}
         </p>
       </div>
     </div>

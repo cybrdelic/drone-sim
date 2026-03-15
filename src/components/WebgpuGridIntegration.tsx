@@ -16,10 +16,14 @@ export function WebgpuGridIntegration({ unitScale = 1000 }: { unitScale?: number
   const stateOverrides = useMemo(
     () => ({
       qualityPreset: "balanced" as const,
+      maxPixelRatio: 1.35,
+      shadowMapResolution: 1024,
+      textureAnisotropy: 4,
       // Drone-sim uses millimeter world units, so the etched showroom floor becomes
       // excessively dense and shimmers under motion if we keep the package defaults.
       useGridEtching: false,
       aoEnabled: false,
+      bloomEnabled: false,
     }),
     [],
   );

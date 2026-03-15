@@ -1,12 +1,11 @@
 import {
     OrbitControls,
 } from "@react-three/drei";
-import { Canvas } from "@react-three/fiber";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { AgXToneMapping, SRGBColorSpace, WebGPURenderer } from "three/webgpu";
 import { DroneModel } from "./components/DroneModel";
-import { GamepadDiagram } from "./components/GamepadDiagram";
 import { Sidebar } from "./components/Sidebar";
 import { WebgpuGridIntegration } from "./components/WebgpuGridIntegration";
 import { DebugSettings, DroneParams, FlightTelemetry, SimSettings, ViewSettings } from "./types";
@@ -22,6 +21,104 @@ type RapierBundle = {
   RigidBody: any;
   CuboidCollider: any;
 };
+
+type CameraMode = "chase" | "close" | "hood";
+
+type PrintPackEntry = {
+  name: string;
+  qty: string;
+  spec: string;
+  fit: string;
+};
+
+function FlightCameraController({
+  enabled,
+  targetRef,
+  mode,
+}: {
+  enabled: boolean;
+  targetRef: React.RefObject<THREE.Group | null>;
+  mode: CameraMode;
+}) {
+  const { camera } = useThree();
+  const worldPos = useRef(new THREE.Vector3());
+  const worldQuat = useRef(new THREE.Quaternion());
+  const offset = useRef(new THREE.Vector3());
+  const localOffset = useRef(new THREE.Vector3());
+  const localFocus = useRef(new THREE.Vector3());
+  const localBackward = useRef(new THREE.Vector3());
+  const localRight = useRef(new THREE.Vector3());
+  const localUp = useRef(new THREE.Vector3());
+  const lookMatrix = useRef(new THREE.Matrix4());
+  const localQuat = useRef(new THREE.Quaternion());
+  const desiredQuat = useRef(new THREE.Quaternion());
+
+  useFrame(() => {
+    if (!enabled || !targetRef.current) return;
+
+    const drone = targetRef.current;
+    drone.updateWorldMatrix(true, false);
+    drone.getWorldPosition(worldPos.current);
+    drone.getWorldQuaternion(worldQuat.current);
+
+    const config =
+      mode === "hood"
+        ? {
+            localOffset: [0, 72, 28] as const,
+            localFocus: [0, 88, 1800] as const,
+          }
+        : mode === "close"
+          ? {
+              localOffset: [0, 140, -520] as const,
+              localFocus: [0, 80, 340] as const,
+            }
+          : {
+              localOffset: [0, 260, -980] as const,
+              localFocus: [0, 120, 520] as const,
+            };
+
+    localOffset.current.set(
+      config.localOffset[0],
+      config.localOffset[1],
+      config.localOffset[2],
+    );
+    localFocus.current.set(
+      config.localFocus[0],
+      config.localFocus[1],
+      config.localFocus[2],
+    );
+
+    localBackward.current
+      .copy(localOffset.current)
+      .sub(localFocus.current)
+      .normalize();
+    localRight.current
+      .crossVectors(new THREE.Vector3(0, 1, 0), localBackward.current)
+      .normalize();
+    if (localRight.current.lengthSq() < 1e-8) {
+      localRight.current.set(1, 0, 0);
+    }
+    localUp.current.crossVectors(localBackward.current, localRight.current).normalize();
+
+    lookMatrix.current.makeBasis(
+      localRight.current,
+      localUp.current,
+      localBackward.current,
+    );
+    localQuat.current.setFromRotationMatrix(lookMatrix.current);
+
+    offset.current.copy(localOffset.current).applyQuaternion(worldQuat.current);
+
+    const desiredPosition = worldPos.current.clone().add(offset.current);
+
+    camera.position.copy(desiredPosition);
+    desiredQuat.current.copy(worldQuat.current).multiply(localQuat.current);
+    camera.quaternion.copy(desiredQuat.current);
+    camera.updateMatrixWorld();
+  });
+
+  return null;
+}
 
 const defaultParams: DroneParams = {
   frameSize: 210, // 5-inch standard
@@ -40,17 +137,36 @@ const defaultParams: DroneParams = {
 };
 
 export default function App() {
+  const defaultFlightTelemetry = useMemo<FlightTelemetry>(() => ({
+    throttle01: 0,
+    thrustN: 0,
+    weightN: 0,
+    tw: 0,
+    altitudeM: 0,
+    speedMS: 0,
+    airspeedMS: 0,
+    windMS: 0,
+    groundEffectMult: 1,
+    batteryV: 0,
+    batteryI: 0,
+    armed: false,
+  }), []);
   const [params, setParams] = useState<DroneParams>(defaultParams);
   const groupRef = useRef<THREE.Group>(null);
-  const viewportRef = useRef<HTMLElement | null>(null);
+  const appShellRef = useRef<HTMLDivElement | null>(null);
   const [rendererBackend, setRendererBackend] = useState<"webgpu" | "webgl2" | "unknown">(
     "unknown",
   );
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
   const [arePanelsVisible, setArePanelsVisible] = useState(true);
+  const [isSnapshotPanelOpen, setIsSnapshotPanelOpen] = useState(false);
+  const [isDetailsPanelOpen, setIsDetailsPanelOpen] = useState(false);
   const [waypoints, setWaypoints] = useState<THREE.Vector3[]>([]);
   const [isFlyingPath, setIsFlyingPath] = useState(false);
+  const [flightResetToken, setFlightResetToken] = useState(0);
   const [controlSensitivity, setControlSensitivity] = useState(0.45);
+  const [cameraMode, setCameraMode] = useState<CameraMode>("chase");
   const [debugSettings, setDebugSettings] = useState<DebugSettings>({
     physicsLines: false,
     flightTelemetry: false,
@@ -73,20 +189,7 @@ export default function App() {
   const [presetId, setPresetId] = useState<
     "oval" | "figure8" | "corkscrew" | "loop"
   >("oval");
-  const flightTelemetryRef = useRef<FlightTelemetry>({
-    throttle01: 0,
-    thrustN: 0,
-    weightN: 0,
-    tw: 0,
-    altitudeM: 0,
-    speedMS: 0,
-    airspeedMS: 0,
-    windMS: 0,
-    groundEffectMult: 1,
-    batteryV: 0,
-    batteryI: 0,
-    armed: false,
-  });
+  const flightTelemetryRef = useRef<FlightTelemetry>(defaultFlightTelemetry);
   const [flightTelemetry, setFlightTelemetry] = useState<FlightTelemetry>(
     flightTelemetryRef.current,
   );
@@ -147,7 +250,11 @@ export default function App() {
 
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsFullscreen(document.fullscreenElement === viewportRef.current);
+      const active = Boolean(document.fullscreenElement);
+      setIsFullscreen(active);
+      if (active) {
+        setIsPseudoFullscreen(false);
+      }
     };
 
     document.addEventListener("fullscreenchange", handleFullscreenChange);
@@ -159,19 +266,44 @@ export default function App() {
   }, []);
 
   const toggleFullscreen = useCallback(async () => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-
     try {
-      if (document.fullscreenElement === viewport) {
+      if (document.fullscreenElement) {
         await document.exitFullscreen();
-      } else if (!document.fullscreenElement) {
-        await viewport.requestFullscreen();
+      } else if (isPseudoFullscreen) {
+        setIsPseudoFullscreen(false);
+      } else {
+        const target = (appShellRef.current ?? document.documentElement) as HTMLElement & {
+          webkitRequestFullscreen?: () => Promise<void> | void;
+        };
+
+        if (document.fullscreenEnabled && typeof target.requestFullscreen === "function") {
+          await target.requestFullscreen();
+        } else if (typeof target.webkitRequestFullscreen === "function") {
+          await target.webkitRequestFullscreen();
+        } else {
+          setIsPseudoFullscreen(true);
+        }
       }
     } catch {
-      // Ignore fullscreen API failures; they are user-agent controlled.
+      setIsPseudoFullscreen(true);
     }
-  }, []);
+  }, [isPseudoFullscreen]);
+
+  useEffect(() => {
+    if (!isPseudoFullscreen) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsPseudoFullscreen(false);
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isPseudoFullscreen]);
 
   useEffect(() => {
     // Debug-bridge client: silently attaches to the local MCP debug server.
@@ -394,12 +526,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!debugSettings.flightTelemetry) return;
+    const shouldStreamTelemetry =
+      arePanelsVisible &&
+      params.viewMode === "flight_sim" &&
+      debugSettings.flightTelemetry;
+
+    if (!shouldStreamTelemetry) return;
+
     const id = window.setInterval(() => {
       setFlightTelemetry({ ...flightTelemetryRef.current });
     }, 200);
+
     return () => window.clearInterval(id);
-  }, [debugSettings.flightTelemetry]);
+  }, [arePanelsVisible, debugSettings.flightTelemetry, params.viewMode]);
 
   const presetWaypoints = useMemo(() => {
     // Generate in world coordinates (mm). DroneModel autopilot converts to meters internally.
@@ -589,53 +728,130 @@ export default function App() {
     };
   }, [params]);
 
+  const isPrintLayoutView = params.viewMode === "print_layout";
+  const printPack = useMemo(() => {
+    const centerRadius = params.fcMounting / 2 + 10;
+    const motorPadRadius = params.motorMountPattern / 2 + 3.5;
+    const bottomPlateSpan = Math.SQRT1_2 * params.frameSize + motorPadRadius * 2 + 12;
+    const topPlateWidth = params.fcMounting + 12;
+    const topPlateDepth = params.fcMounting + 30;
+    const carbonSheetSize = Math.max(
+      300,
+      Math.ceil(bottomPlateSpan + topPlateWidth + 72),
+    );
+    const strapPitch = centerRadius * 1.4;
+    const isM3Motor = params.motorMountPattern >= 16;
+
+    const carbonParts: PrintPackEntry[] = [
+      {
+        name: "Unibody bottom plate",
+        qty: "1x",
+        spec: `${bottomPlateSpan.toFixed(0)} mm envelope • ${params.plateThickness.toFixed(1)} mm carbon`,
+        fit: `${params.motorMountPattern.toFixed(1)}×${params.motorMountPattern.toFixed(1)} mm motor pattern • ${params.motorCenterHole.toFixed(1)} mm center relief`,
+      },
+      {
+        name: "Top plate",
+        qty: "1x",
+        spec: `${topPlateWidth.toFixed(1)} × ${topPlateDepth.toFixed(1)} mm • ${params.topPlateThickness.toFixed(1)} mm carbon`,
+        fit: `${params.fcMounting.toFixed(1)}×${params.fcMounting.toFixed(1)} mm stack • strap slot pitch ${strapPitch.toFixed(1)} mm`,
+      },
+    ];
+
+    const tpuParts: PrintPackEntry[] = params.showTPU
+      ? [
+          {
+            name: "FPV camera cradle",
+            qty: "3 pcs",
+            spec: "2 side cheeks + 1 floor rail, all laid flat",
+            fit: "19×19 mm micro camera envelope • 22 mm support faces",
+          },
+          {
+            name: "Action cam mount",
+            qty: "5 pcs",
+            spec: "Base, twin forks, 2 cam lugs separated for clean printing",
+            fit: "24×20 mm base • 15 mm fork faces • 15 mm lug discs",
+          },
+          {
+            name: "Antenna mount pack",
+            qty: "4 pcs",
+            spec: "Rear bridge, VTX tube, 2 RX tubes",
+            fit: `${params.standoffHeight.toFixed(0)} mm bridge length reference • 20/30 mm tube lengths`,
+          },
+          {
+            name: "Motor bumpers",
+            qty: "4 pcs",
+            spec: "Separated TPU guards with cooling gap between copies",
+            fit: `${(params.motorMountPattern / 2 + 4.5).toFixed(1)} mm inner radius target`,
+          },
+        ]
+      : [];
+
+    const referenceParts: PrintPackEntry[] = [
+      {
+        name: "Frame standoffs / spacers",
+        qty: "4x",
+        spec: `Purchased aluminum hex standoffs • M3 × ${params.standoffHeight.toFixed(0)} mm`,
+        fit: `3.2 mm plate clearance • ${params.fcMounting.toFixed(1)}×${params.fcMounting.toFixed(1)} mm bolt square`,
+      },
+      {
+        name: "Propellers",
+        qty: "4x",
+        spec: `Purchased ${params.propSize.toFixed(1)} in tri-blades; not included in print pack`,
+        fit: "13 mm hub OD • 7 mm hub height • 4.4 mm modeled shaft land • 8 mm nyloc nut envelope",
+      },
+      {
+        name: "Motors",
+        qty: "4x",
+        spec: `Purchased outrunners • ${params.motorMountPattern.toFixed(1)}×${params.motorMountPattern.toFixed(1)} mm bolt pattern`,
+        fit: `${isM3Motor ? "M3" : "M2"} fasteners • ${params.motorCenterHole.toFixed(1)} mm center relief through arm pads`,
+      },
+      {
+        name: "FC stack hardware",
+        qty: "1 set",
+        spec: `Purchased ${params.fcMounting.toFixed(1)}×${params.fcMounting.toFixed(1)} mm stack + screws/grommets`,
+        fit: "4× M3 clearance holes • 14 mm screw shaft in model • nyloc top lock",
+      },
+      {
+        name: "Battery retention",
+        qty: "2x",
+        spec: "Purchased nylon straps; not printed",
+        fit: `20 × 3 mm slots on top plate • ${strapPitch.toFixed(1)} mm slot pitch`,
+      },
+    ];
+
+    return {
+      carbonSheetSize,
+      tpuBedSize: 220,
+      strapPitch,
+      carbonParts,
+      tpuParts,
+      referenceParts,
+    };
+  }, [params]);
+
   const rapierCacheRef = useRef<RapierBundle | null>(null);
   const rapierLoadPromiseRef = useRef<Promise<RapierBundle> | null>(null);
   const [rapier, setRapier] = useState<RapierBundle | null>(null);
   const needsRapier = params.viewMode === "flight_sim" || debugSettings.physicsLines;
+  const isFlightSimView = params.viewMode === "flight_sim";
+  const rendererLabel =
+    rendererBackend === "webgpu"
+      ? "WebGPU"
+      : rendererBackend === "webgl2"
+        ? "WebGL2 Fallback"
+        : "Unknown";
+  const snapshotClass =
+    params.frameSize >= 250 ? "7-inch" : params.frameSize >= 200 ? "5-inch" : "3-inch";
+  const isImmersive = isFullscreen || isPseudoFullscreen;
+  const cameraModeLabel =
+    cameraMode === "hood" ? "Hood Cam" : cameraMode === "close" ? "Close Chase" : "Far Chase";
 
-  // Prefetch Rapier after initial paint so flight_sim can become interactive immediately,
-  // without forcing Rapier onto the critical-path bundle.
-  useEffect(() => {
-    let cancelled = false;
-
-    const load = () => {
-      if (rapierCacheRef.current) return;
-      if (!rapierLoadPromiseRef.current) {
-        rapierLoadPromiseRef.current = import("@react-three/rapier").then((m) => {
-          const bundle: RapierBundle = {
-            Physics: (m as any).Physics,
-            RigidBody: (m as any).RigidBody,
-            CuboidCollider: (m as any).CuboidCollider,
-          };
-          rapierCacheRef.current = bundle;
-          return bundle;
-        });
-      }
-
-      rapierLoadPromiseRef.current
-        .then((bundle) => {
-          if (cancelled) return;
-          if (needsRapier) setRapier(bundle);
-        })
-        .catch(() => {
-          // ignore: if Rapier fails to load we just won't mount physics.
-        });
-    };
-
-    const w = typeof window !== "undefined" ? (window as any) : null;
-    if (w && typeof w.requestIdleCallback === "function") {
-      w.requestIdleCallback(load, { timeout: 2000 });
-    } else {
-      // Start prefetch ASAP (after current paint).
-      window.setTimeout(load, 0);
-    }
-
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const handleResetFlight = useCallback(() => {
+    setIsFlyingPath(false);
+    flightTelemetryRef.current = { ...defaultFlightTelemetry };
+    setFlightTelemetry({ ...defaultFlightTelemetry });
+    setFlightResetToken((token) => token + 1);
+  }, [defaultFlightTelemetry]);
 
   useEffect(() => {
     let cancelled = false;
@@ -684,7 +900,7 @@ export default function App() {
   }, [needsRapier]);
 
   return (
-    <div className="flex h-screen w-full bg-[#0a0a0a] overflow-hidden font-sans text-neutral-200">
+    <div ref={appShellRef} className={`drone-app-shell flex h-screen w-full overflow-hidden font-sans text-neutral-200${isImmersive ? " is-fullscreen" : ""}`}>
       {arePanelsVisible && (
         <Sidebar
           params={params}
@@ -700,320 +916,439 @@ export default function App() {
         />
       )}
 
-      <main ref={viewportRef} className="flex-1 relative cursor-move">
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setArePanelsVisible((prev) => !prev)}
-            className="bg-neutral-950/85 text-neutral-100 border border-neutral-700 hover:border-emerald-500/60 hover:text-white px-4 py-2 rounded-full text-[11px] uppercase tracking-[0.22em] shadow-2xl backdrop-blur transition-colors"
-          >
-            {arePanelsVisible ? "Hide Panels" : "Show Panels"}
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              void toggleFullscreen();
-            }}
-            className="bg-neutral-950/85 text-neutral-100 border border-neutral-700 hover:border-emerald-500/60 hover:text-white px-4 py-2 rounded-full text-[11px] uppercase tracking-[0.22em] shadow-2xl backdrop-blur transition-colors"
-          >
-            {isFullscreen ? "Exit Fullscreen" : "Fullscreen View"}
-          </button>
-        </div>
-
-        {arePanelsVisible && (
-          <>
-            {/* Frame Specs Panel (Top Left) */}
-            <div className="absolute top-4 left-4 z-10 pointer-events-none">
-              <div className="bg-[#111]/90 backdrop-blur border border-neutral-800 p-4 rounded-lg shadow-2xl">
-                <h2 className="text-xs font-bold uppercase tracking-widest text-neutral-100 mb-3">
-                  Frame Specifications
-                </h2>
-                <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-[11px] font-mono text-neutral-400">
-                  <div>CLASS</div>
-                  <div className="text-emerald-400 text-right">
-                    {params.frameSize >= 250
-                      ? "7-INCH"
-                      : params.frameSize >= 200
-                        ? "5-INCH"
-                        : "3-INCH"}
-                  </div>
-
-                  <div>DIAGONAL</div>
-                  <div className="text-neutral-200 text-right">
-                    {params.frameSize.toFixed(1)} mm
-                  </div>
-
-                  <div>STACK</div>
-                  <div className="text-neutral-200 text-right">
-                    {params.fcMounting}x{params.fcMounting} mm
-                  </div>
-
-                  <div>MOTORS</div>
-                  <div className="text-neutral-200 text-right">
-                    {params.motorMountPattern}x{params.motorMountPattern} mm
-                  </div>
-
-                  <div>Z-HEIGHT</div>
-                  <div className="text-neutral-200 text-right">
-                    {(
-                      params.plateThickness +
-                      params.standoffHeight +
-                      params.topPlateThickness
-                    ).toFixed(1)}{" "}
-                    mm
-                  </div>
-                </div>
+      <main className="app-main-shell">
+        <div className="app-main-column">
+          <header className="app-toolbar">
+            <div className="app-toolbar-group">
+              <div className="app-title-block">
+                <div className="app-title">Drone Sim</div>
+                <div className="app-subtitle">Viewport workspace</div>
               </div>
+              <div className="chrome-meta">
+                <span className="status-label">Mode</span>
+                <span className="status-value">{params.viewMode.replace("_", " ")}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setArePanelsVisible((prev) => {
+                    if (prev) {
+                      setIsSnapshotPanelOpen(false);
+                      setIsDetailsPanelOpen(false);
+                    }
+
+                    return !prev;
+                  });
+                }}
+                className="toolbar-chip toolbar-chip-primary"
+              >
+                {arePanelsVisible ? "Hide Inspector" : "Show Inspector"}
+              </button>
+              {arePanelsVisible && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setIsSnapshotPanelOpen((prev) => !prev)}
+                    className={isSnapshotPanelOpen ? "toolbar-chip toolbar-chip-primary" : "toolbar-chip"}
+                  >
+                    Snapshot
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsDetailsPanelOpen((prev) => !prev)}
+                    className={isDetailsPanelOpen ? "toolbar-chip toolbar-chip-primary" : "toolbar-chip"}
+                  >
+                    Details
+                  </button>
+                </>
+              )}
             </div>
-
-            {/* Engineering Telemetry Panel (Top Right) */}
-            <div className="absolute top-4 right-4 z-10 pointer-events-none w-80">
-              <div className="bg-[#111]/90 backdrop-blur border border-neutral-800 p-4 rounded-lg shadow-2xl">
-                <h2 className="text-[10px] font-bold uppercase tracking-widest text-emerald-500 mb-4 flex items-center gap-2">
-                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                  Engineering & Kinematics
-                </h2>
-
-                <div className="space-y-4">
-                  <div>
-                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                      Material Specs
-                    </div>
-                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                      <div className="text-neutral-400">COMPOSITE</div>
-                      <div className="text-neutral-200 text-right">
-                        Toray T700 3K
-                      </div>
-                      <div className="text-neutral-400">DENSITY</div>
-                      <div className="text-neutral-200 text-right">1.60 g/cm³</div>
-                      <div className="text-neutral-400">TOLERANCE</div>
-                      <div className="text-neutral-200 text-right">±0.05 mm</div>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                      Mass Analysis
-                    </div>
-                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                      <div className="text-neutral-400">DRY FRAME</div>
-                      <div className="text-neutral-200 text-right">
-                        {engData.frameWeight_g.toFixed(1)} g
-                      </div>
-                      <div className="text-neutral-400">EST. AUW</div>
-                      <div className="text-neutral-200 text-right">
-                        {engData.auw_g.toFixed(1)} g
-                      </div>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                      Aerodynamics (Max)
-                    </div>
-                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                      <div className="text-neutral-400">TOTAL LIFT</div>
-                      <div className="text-neutral-200 text-right">
-                        {engData.totalThrust_g.toFixed(0)} g
-                      </div>
-                      <div className="text-neutral-400">T/W RATIO</div>
-                      <div className="text-emerald-400 text-right">
-                        {engData.twRatio.toFixed(2)} : 1
-                      </div>
-                      <div className="text-neutral-400">HOVER THR.</div>
-                      <div className="text-neutral-200 text-right">
-                        {engData.hoverThrottle.toFixed(1)} %
-                      </div>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
-                      Structural Integrity
-                    </div>
-                    <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
-                      <div className="text-neutral-400">ARM TENSION</div>
-                      <div className="text-neutral-200 text-right">
-                        {engData.maxStress_MPa.toFixed(1)} MPa
-                      </div>
-                      <div className="text-neutral-400">YIELD STRENGTH</div>
-                      <div className="text-neutral-200 text-right">600.0 MPa</div>
-                      <div className="text-neutral-400">SAFETY FACTOR</div>
-                      <div
-                        className={`text-right font-bold ${engData.safetyFactor < 1.5 ? "text-rose-500" : engData.safetyFactor < 3 ? "text-yellow-500" : "text-emerald-500"}`}
+            <div className="app-toolbar-group justify-end">
+              {isFlightSimView && (
+                <>
+                  <div className="chrome-meta">
+                    <span className="status-label">Camera</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setCameraMode("chase")}
+                        className={cameraMode === "chase" ? "toolbar-chip toolbar-chip-primary" : "toolbar-chip"}
                       >
-                        {engData.safetyFactor.toFixed(2)}x
+                        Chase
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setCameraMode("close")}
+                        className={cameraMode === "close" ? "toolbar-chip toolbar-chip-primary" : "toolbar-chip"}
+                      >
+                        Close
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setCameraMode("hood")}
+                        className={cameraMode === "hood" ? "toolbar-chip toolbar-chip-primary" : "toolbar-chip"}
+                      >
+                        Hood
+                      </button>
+                    </div>
+                  </div>
+                  <select
+                    value={presetId}
+                    onChange={(e) => setPresetId(e.target.value as any)}
+                    disabled={isFlyingPath}
+                    className="ui-select chrome-select disabled:opacity-50"
+                  >
+                    <option value="oval">Oval</option>
+                    <option value="figure8">Figure 8</option>
+                    <option value="corkscrew">Corkscrew</option>
+                    <option value="loop">Vertical Loop</option>
+                  </select>
+                  <div className="chrome-meta chrome-control">
+                    <span className="status-label">Control</span>
+                    <input
+                      type="range"
+                      min={0.2}
+                      max={1}
+                      step={0.05}
+                      value={controlSensitivity}
+                      onChange={(e) => setControlSensitivity(parseFloat(e.target.value))}
+                      disabled={isFlyingPath}
+                      className="ui-slider chrome-slider cursor-pointer disabled:opacity-50"
+                    />
+                    <span className="status-value">{(controlSensitivity * 100).toFixed(0)}%</span>
+                  </div>
+                  <button
+                    className="toolbar-chip disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={() => setWaypoints(presetWaypoints[presetId].map((p) => p.clone()))}
+                    disabled={isFlyingPath}
+                  >
+                    Load
+                  </button>
+                  <button
+                    className="toolbar-chip disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={() => setWaypoints([])}
+                    disabled={isFlyingPath}
+                  >
+                    Clear
+                  </button>
+                  <button
+                    className="toolbar-chip"
+                    onClick={handleResetFlight}
+                  >
+                    Reset
+                  </button>
+                  <button
+                    className="toolbar-chip toolbar-chip-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={() => setIsFlyingPath(true)}
+                    disabled={waypoints.length < 2 || isFlyingPath}
+                  >
+                    {isFlyingPath ? "Flying" : "Fly"}
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  void toggleFullscreen();
+                }}
+                className="toolbar-chip"
+              >
+                {isImmersive ? "Exit Fullscreen" : "Fullscreen"}
+              </button>
+            </div>
+          </header>
+
+          <section className="etched-panel viewport-shell cursor-move">
+            {arePanelsVisible && isSnapshotPanelOpen && (
+            <div className="viewport-dock viewport-dock-left">
+              <div className="etched-panel viewport-panel">
+                {isPrintLayoutView ? (
+                  <>
+                    <div className="kicker mb-2">Fabrication Snapshot</div>
+                    <h2 className="text-xs font-semibold tracking-[0.02em] text-neutral-100 mb-3 uppercase">
+                      Print Pack Summary
+                    </h2>
+                    <div className="grid grid-cols-2 gap-x-5 gap-y-2 text-[11px] font-mono text-white/70">
+                      <div>CARBON STOCK</div>
+                      <div className="text-neutral-100 text-right">
+                        {printPack.carbonSheetSize} mm
+                      </div>
+
+                      <div>TPU BED</div>
+                      <div className="text-neutral-100 text-right">
+                        {printPack.tpuBedSize} mm
+                      </div>
+
+                      <div>CARBON PARTS</div>
+                      <div className="text-neutral-100 text-right">
+                        {printPack.carbonParts.length}
+                      </div>
+
+                      <div>TPU PARTS</div>
+                      <div className="text-neutral-100 text-right">
+                        {printPack.tpuParts.length}
+                      </div>
+
+                      <div>REF HARDWARE</div>
+                      <div className="text-neutral-100 text-right">
+                        {printPack.referenceParts.length}
+                      </div>
+
+                      <div>STRAP PITCH</div>
+                      <div className="text-[#dbe8ff] text-right">
+                        {printPack.strapPitch.toFixed(1)} mm
                       </div>
                     </div>
-                    <div className="mt-2 h-1.5 w-full bg-neutral-800 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full transition-all duration-300 ${engData.safetyFactor < 1.5 ? "bg-rose-500" : engData.safetyFactor < 3 ? "bg-yellow-500" : "bg-emerald-500"}`}
-                        style={{
-                          width: `${Math.min((600 / engData.maxStress_MPa) * 20, 100)}%`,
-                        }}
-                      />
+                  </>
+                ) : (
+                  <>
+                    <div className="kicker mb-2">System Snapshot</div>
+                    <h2 className="text-xs font-semibold tracking-[0.02em] text-neutral-100 mb-3 uppercase">
+                      Frame Specifications
+                    </h2>
+                    <div className="grid grid-cols-2 gap-x-5 gap-y-2 text-[11px] font-mono text-white/70">
+                      <div>CLASS</div>
+                      <div className="text-[#dbe8ff] text-right">
+                        {params.frameSize >= 250
+                          ? "7-INCH"
+                          : params.frameSize >= 200
+                            ? "5-INCH"
+                            : "3-INCH"}
+                      </div>
+
+                      <div>DIAGONAL</div>
+                      <div className="text-neutral-100 text-right">
+                        {params.frameSize.toFixed(1)} mm
+                      </div>
+
+                      <div>STACK</div>
+                      <div className="text-neutral-100 text-right">
+                        {params.fcMounting}x{params.fcMounting} mm
+                      </div>
+
+                      <div>MOTORS</div>
+                      <div className="text-neutral-100 text-right">
+                        {params.motorMountPattern}x{params.motorMountPattern} mm
+                      </div>
+
+                      <div>Z-HEIGHT</div>
+                      <div className="text-neutral-100 text-right">
+                        {(
+                          params.plateThickness +
+                          params.standoffHeight +
+                          params.topPlateThickness
+                        ).toFixed(1)}{" "}
+                        mm
+                      </div>
                     </div>
-                  </div>
-                </div>
+                  </>
+                )}
               </div>
             </div>
-          </>
-        )}
+            )}
 
-        {/* Flight Sim Controls Overlay */}
-        {arePanelsVisible && params.viewMode === "flight_sim" && (
-          <>
-            <div className="absolute top-24 left-1/2 -translate-x-1/2 z-10 flex gap-4 pointer-events-auto">
-              <div className="bg-neutral-900/80 text-neutral-400 px-3 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center gap-2">
-                <span className="text-neutral-500">Preset</span>
-                <select
-                  value={presetId}
-                  onChange={(e) => setPresetId(e.target.value as any)}
-                  disabled={isFlyingPath}
-                  className="bg-neutral-900 border border-neutral-700 text-neutral-200 text-xs px-2 py-1 rounded outline-none focus:border-emerald-500 transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  <option value="oval">Oval</option>
-                  <option value="figure8">Figure 8</option>
-                  <option value="corkscrew">Corkscrew</option>
-                  <option value="loop">Vertical Loop</option>
-                </select>
-                <button
-                  className="bg-neutral-800 border border-neutral-700 text-white px-3 py-1.5 rounded text-xs hover:bg-neutral-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  onClick={() => setWaypoints(presetWaypoints[presetId].map((p) => p.clone()))}
-                  disabled={isFlyingPath}
-                >
-                  Load
-                </button>
-              </div>
+            {arePanelsVisible && isDetailsPanelOpen && (
+            <div className="viewport-dock viewport-dock-right">
+              <div className="etched-panel viewport-panel w-[300px]">
+                {isPrintLayoutView ? (
+                  <>
+                    <h2 className="text-[10px] font-bold uppercase tracking-[0.18em] text-white/60 mb-4 flex items-center gap-2">
+                      <div className="w-1.5 h-1.5 bg-[#34d399]" />
+                      Print Pack & BOM
+                    </h2>
 
-              <div className="bg-neutral-900/80 text-neutral-400 px-3 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center gap-2">
-                <span className="text-neutral-500">Control</span>
-                <input
-                  type="range"
-                  min={0.2}
-                  max={1}
-                  step={0.05}
-                  value={controlSensitivity}
-                  onChange={(e) => setControlSensitivity(parseFloat(e.target.value))}
-                  disabled={isFlyingPath}
-                  className="w-28 h-1.5 bg-neutral-800 rounded-full appearance-none cursor-pointer disabled:opacity-50 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-400 hover:[&::-webkit-slider-thumb]:bg-emerald-300"
-                />
-                <span className="text-[11px] font-mono text-emerald-400 w-10 text-right">
-                  {(controlSensitivity * 100).toFixed(0)}%
-                </span>
-              </div>
+                    <div className="space-y-4 text-[11px] font-mono text-white/75">
+                      <div>
+                        <div className="text-[9px] text-white/45 mb-2 uppercase tracking-[0.14em]">
+                          Carbon Cut Sheet
+                        </div>
+                        <div className="space-y-2">
+                          {printPack.carbonParts.map((part) => (
+                            <div key={part.name} className="rounded-sm border border-white/8 bg-black/10 p-2">
+                              <div className="flex items-start justify-between gap-3 text-neutral-100">
+                                <span>{part.name}</span>
+                                <span className="text-[#dbe8ff]">{part.qty}</span>
+                              </div>
+                              <div className="mt-1 text-white/55">{part.spec}</div>
+                              <div className="mt-1 text-emerald-300/85">{part.fit}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
 
-              <button
-                className="bg-neutral-800 border border-neutral-700 text-white px-4 py-2 rounded text-xs hover:bg-neutral-700 transition-colors"
-                onClick={() => setWaypoints([])}
-                disabled={isFlyingPath}
-              >
-                Clear Path
-              </button>
-              <button
-                className="bg-emerald-600 border border-emerald-500 text-white px-4 py-2 rounded text-xs hover:bg-emerald-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                onClick={() => setIsFlyingPath(true)}
-                disabled={waypoints.length < 2 || isFlyingPath}
-              >
-                {isFlyingPath ? "Flying..." : "Fly Path"}
-              </button>
-              <div className="bg-neutral-900/80 text-neutral-400 px-4 py-2 rounded text-xs border border-neutral-800 backdrop-blur flex items-center">
-                Click on the ground to add waypoints
+                      <div>
+                        <div className="text-[9px] text-white/45 mb-2 uppercase tracking-[0.14em]">
+                          TPU Print Pack
+                        </div>
+                        {printPack.tpuParts.length > 0 ? (
+                          <div className="space-y-2">
+                            {printPack.tpuParts.map((part) => (
+                              <div key={part.name} className="rounded-sm border border-white/8 bg-black/10 p-2">
+                                <div className="flex items-start justify-between gap-3 text-neutral-100">
+                                  <span>{part.name}</span>
+                                  <span className="text-[#dbe8ff]">{part.qty}</span>
+                                </div>
+                                <div className="mt-1 text-white/55">{part.spec}</div>
+                                <div className="mt-1 text-emerald-300/85">{part.fit}</div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="rounded-sm border border-dashed border-white/10 bg-black/10 p-2 text-white/45">
+                            TPU accessories are disabled, so the print bed only carries carbon references.
+                          </div>
+                        )}
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] text-white/45 mb-2 uppercase tracking-[0.14em]">
+                          Reference Hardware / Adapters
+                        </div>
+                        <div className="space-y-2">
+                          {printPack.referenceParts.map((part) => (
+                            <div key={part.name} className="rounded-sm border border-white/8 bg-black/10 p-2">
+                              <div className="flex items-start justify-between gap-3 text-neutral-100">
+                                <span>{part.name}</span>
+                                <span className="text-[#dbe8ff]">{part.qty}</span>
+                              </div>
+                              <div className="mt-1 text-white/55">{part.spec}</div>
+                              <div className="mt-1 text-amber-300/85">{part.fit}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <h2 className="text-[10px] font-bold uppercase tracking-[0.18em] text-white/60 mb-4 flex items-center gap-2">
+                      <div className="w-1.5 h-1.5 bg-[#729ad6]" />
+                      Engineering & Kinematics
+                    </h2>
+
+                    <div className="space-y-4">
+                      <div>
+                        <div className="text-[9px] text-white/45 mb-1.5 uppercase tracking-[0.14em]">
+                          Material Specs
+                        </div>
+                        <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                          <div className="text-white/45">COMPOSITE</div>
+                          <div className="text-neutral-100 text-right">
+                            Toray T700 3K
+                          </div>
+                          <div className="text-white/45">DENSITY</div>
+                          <div className="text-neutral-100 text-right">1.60 g/cm³</div>
+                          <div className="text-white/45">TOLERANCE</div>
+                          <div className="text-neutral-100 text-right">±0.05 mm</div>
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                          Mass Analysis
+                        </div>
+                        <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                          <div className="text-neutral-400">DRY FRAME</div>
+                          <div className="text-neutral-200 text-right">
+                            {engData.frameWeight_g.toFixed(1)} g
+                          </div>
+                          <div className="text-neutral-400">EST. AUW</div>
+                          <div className="text-neutral-200 text-right">
+                            {engData.auw_g.toFixed(1)} g
+                          </div>
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                          Aerodynamics (Max)
+                        </div>
+                        <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                          <div className="text-neutral-400">TOTAL LIFT</div>
+                          <div className="text-neutral-200 text-right">
+                            {engData.totalThrust_g.toFixed(0)} g
+                          </div>
+                          <div className="text-neutral-400">T/W RATIO</div>
+                          <div className="text-emerald-400 text-right">
+                            {engData.twRatio.toFixed(2)} : 1
+                          </div>
+                          <div className="text-neutral-400">HOVER THR.</div>
+                          <div className="text-neutral-200 text-right">
+                            {engData.hoverThrottle.toFixed(1)} %
+                          </div>
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] text-neutral-500 mb-1.5 uppercase tracking-wider">
+                          Structural Integrity
+                        </div>
+                        <div className="grid grid-cols-2 gap-1 text-[11px] font-mono">
+                          <div className="text-neutral-400">ARM TENSION</div>
+                          <div className="text-neutral-200 text-right">
+                            {engData.maxStress_MPa.toFixed(1)} MPa
+                          </div>
+                          <div className="text-neutral-400">YIELD STRENGTH</div>
+                          <div className="text-neutral-200 text-right">600.0 MPa</div>
+                          <div className="text-neutral-400">SAFETY FACTOR</div>
+                          <div
+                            className={`text-right font-bold ${engData.safetyFactor < 1.5 ? "text-rose-500" : engData.safetyFactor < 3 ? "text-yellow-500" : "text-emerald-500"}`}
+                          >
+                            {engData.safetyFactor.toFixed(2)}x
+                          </div>
+                        </div>
+                        <div className="mt-2 h-1.5 w-full bg-neutral-800 rounded-sm overflow-hidden">
+                          <div
+                            className={`h-full transition-all duration-300 ${engData.safetyFactor < 1.5 ? "bg-rose-500" : engData.safetyFactor < 3 ? "bg-yellow-500" : "bg-emerald-500"}`}
+                            style={{
+                              width: `${Math.min((600 / engData.maxStress_MPa) * 20, 100)}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
-            <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
-              <div className="bg-[#111]/90 backdrop-blur border border-emerald-500/30 p-4 rounded-lg shadow-[0_0_30px_rgba(16,185,129,0.1)] flex items-center gap-8">
-                <div className="text-center">
-                  <div className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-2">
-                    Pitch / Roll
-                  </div>
-                <div className="grid grid-cols-3 gap-1">
-                  <div />
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
-                    W
-                  </div>
-                  <div />
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
-                    A
-                  </div>
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
-                    S
-                  </div>
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
-                    D
-                  </div>
-                </div>
-              </div>
-              <div className="w-[1px] h-16 bg-neutral-800" />
-              <div className="text-center">
-                <div className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-2">
-                  Throttle / Yaw
-                </div>
-                <div className="grid grid-cols-3 gap-1">
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
-                    Q
-                  </div>
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-emerald-500/50 flex items-center justify-center text-xs font-mono text-emerald-400">
-                    SPC
-                  </div>
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-xs font-mono text-neutral-400">
-                    E
-                  </div>
-                  <div />
-                  <div className="w-8 h-8 rounded bg-neutral-800 border border-emerald-500/50 flex items-center justify-center text-xs font-mono text-emerald-400">
-                    SHF
-                  </div>
-                  <div />
-                </div>
-              </div>
-            </div>
-          </div>
-
-            <div className="absolute bottom-4 right-4 z-10 pointer-events-none">
-              <GamepadDiagram />
-            </div>
-
-            <div className="absolute bottom-4 left-4 z-10 pointer-events-none">
-              <div
-                className={
-                  "text-[10px] font-mono px-2 py-1 rounded border backdrop-blur " +
-                  (rendererBackend === "webgpu"
-                    ? "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
-                    : rendererBackend === "webgl2"
-                      ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
-                      : "text-neutral-400 border-neutral-700 bg-neutral-900/70")
-                }
-              >
-                {rendererBackend === "webgpu"
-                  ? "Renderer: WebGPU"
-                  : rendererBackend === "webgl2"
-                    ? "Renderer: WebGL2 fallback"
-                    : "Renderer: (unknown)"}
-              </div>
-            </div>
-          </>
-        )}
-
+            )}
+            <div className="viewport-canvas">
         <Canvas
-          dpr={[1, 1.8]}
+          frameloop={isFlightSimView ? "always" : "demand"}
+          dpr={isFlightSimView ? [1, 1.1] : [1, 1.45]}
           camera={{
             // Frame the quad at a usable default distance in the sim's mm world.
             position: [2600, 1450, 2600],
             fov: 55,
-            near: 50,
-            far: 500000,
+            near: 5,
+            far: 300000,
           }}
           onCreated={({ camera, scene }) => {
             scene.background = null;
             camera.updateProjectionMatrix();
           }}
           gl={glFactory as any}
-          shadows
+          shadows={!isFlightSimView}
         >
-          {/* Imported integration: environment + post-processing */}
-          <WebgpuGridIntegration unitScale={1000} />
+          {isFlightSimView ? (
+            <>
+              <ambientLight intensity={1.2} />
+              <hemisphereLight intensity={0.7} color="#f8fafc" groundColor="#334155" />
+              <directionalLight position={[4000, 6000, 2500]} intensity={1.8} />
+              <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1, 0]}>
+                <planeGeometry args={[120000, 120000]} />
+                <meshStandardMaterial color="#2b3138" roughness={1} metalness={0} />
+              </mesh>
+              <gridHelper
+                args={[120000, 120, "#475569", "#2a3037"]}
+                position={[0, 2, 0]}
+              />
+            </>
+          ) : (
+            <WebgpuGridIntegration unitScale={1000} />
+          )}
 
-          {params.viewMode === "flight_sim" ? (
+          {isFlightSimView ? (
             rapier ? (
               <rapier.Physics gravity={[0, -9810, 0]}>
                 {debugSettings.physicsLines && (
@@ -1039,6 +1374,7 @@ export default function App() {
                     RigidBody: rapier.RigidBody,
                     CuboidCollider: rapier.CuboidCollider,
                   }}
+                  resetToken={flightResetToken}
                   waypoints={waypoints}
                   isFlyingPath={isFlyingPath}
                   onFlightComplete={() => setIsFlyingPath(false)}
@@ -1086,6 +1422,7 @@ export default function App() {
                 simSettings={simSettings}
                 groupRef={groupRef}
                 flightTelemetryRef={flightTelemetryRef}
+                resetToken={flightResetToken}
                 waypoints={waypoints}
                 isFlyingPath={isFlyingPath}
                 onFlightComplete={() => setIsFlyingPath(false)}
@@ -1099,6 +1436,7 @@ export default function App() {
               simSettings={simSettings}
               groupRef={groupRef}
               flightTelemetryRef={flightTelemetryRef}
+              resetToken={flightResetToken}
               waypoints={waypoints}
               isFlyingPath={isFlyingPath}
               onFlightComplete={() => setIsFlyingPath(false)}
@@ -1106,16 +1444,122 @@ export default function App() {
             />
           )}
 
-          <OrbitControls
-            makeDefault
-            enableDamping
-            dampingFactor={0.08}
-            maxPolarAngle={Math.PI * 0.48}
-            minDistance={500}
-            maxDistance={130000}
-            target={[0, 180, 0]}
+          <FlightCameraController
+            enabled={isFlightSimView}
+            targetRef={groupRef}
+            mode={cameraMode}
           />
+
+          {!isFlightSimView && (
+            <OrbitControls
+              makeDefault
+              enableDamping={false}
+              zoomSpeed={1.25}
+              rotateSpeed={0.9}
+              maxPolarAngle={Math.PI * 0.48}
+              minDistance={80}
+              maxDistance={130000}
+              target={[0, 120, 0]}
+            />
+          )}
         </Canvas>
+            </div>
+          </section>
+
+          <footer className="status-bar">
+            <div className="status-cluster">
+              <div className="status-item">
+                <span className="status-label">Class</span>
+                <span className="status-value">{snapshotClass}</span>
+              </div>
+              <div className="status-item">
+                <span className="status-label">Frame</span>
+                <span className="status-value">{params.frameSize.toFixed(0)} mm</span>
+              </div>
+              <div className="status-item">
+                <span className="status-label">Prop</span>
+                <span className="status-value">{params.propSize.toFixed(1)} in</span>
+              </div>
+              {isFlightSimView ? (
+                <>
+                  <div className="status-item">
+                    <span className="status-label">Alt</span>
+                    <span className="status-value">{(flightTelemetry.altitudeM ?? 0).toFixed(1)} m</span>
+                  </div>
+                  <div className="status-item">
+                    <span className="status-label">Speed</span>
+                    <span className="status-value">{(flightTelemetry.speedMS ?? 0).toFixed(1)} m/s</span>
+                  </div>
+                  <div className="status-item">
+                    <span className="status-label">Throttle</span>
+                    <span className="status-value">{((flightTelemetry.throttle01 ?? 0) * 100).toFixed(0)}%</span>
+                  </div>
+                </>
+              ) : isPrintLayoutView ? (
+                <>
+                  <div className="status-item">
+                    <span className="status-label">Carbon Sheet</span>
+                    <span className="status-value">{printPack.carbonSheetSize} mm</span>
+                  </div>
+                  <div className="status-item">
+                    <span className="status-label">TPU Pack</span>
+                    <span className="status-value">{printPack.tpuParts.length} items</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="status-item">
+                    <span className="status-label">AUW</span>
+                    <span className="status-value">{engData.auw_g.toFixed(0)} g</span>
+                  </div>
+                  <div className="status-item">
+                    <span className="status-label">T/W</span>
+                    <span className="status-value">{engData.twRatio.toFixed(2)}x</span>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="status-cluster">
+              <div className="status-item">
+                <span className="status-label">Renderer</span>
+                <span className="status-value">{rendererLabel}</span>
+              </div>
+              <div className="status-item">
+                <span className="status-label">Camera</span>
+                <span className="status-value">{isFlightSimView ? cameraModeLabel : "Orbit"}</span>
+              </div>
+            </div>
+
+            <div className="status-cluster status-cluster-end">
+              {isFlightSimView ? (
+                <>
+                  <div className="status-item">
+                    <span className="status-label">Path</span>
+                    <span className="status-value">{waypoints.length} points</span>
+                  </div>
+                  <div className="status-item">
+                    <span className="status-label">State</span>
+                    <span className="status-value">{isFlyingPath ? "Autopilot" : "Manual"}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="status-item">
+                    <span className="status-label">View</span>
+                    <span className="status-value">{viewSettings.focus}</span>
+                  </div>
+                  {isPrintLayoutView && (
+                    <div className="status-item">
+                      <span className="status-label">Ref Items</span>
+                      <span className="status-value">{printPack.referenceParts.length}</span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </footer>
+        </div>
       </main>
     </div>
   );
