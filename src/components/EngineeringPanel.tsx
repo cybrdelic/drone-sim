@@ -11,8 +11,14 @@ import {
   ControlGroup,
   releaseFlightInputFocus,
   Select,
-  Slider,
+  SimSettingsSliderList,
 } from "./panels/PanelControls";
+import {
+  engineeringRateControls,
+  engineeringSensorControls,
+  engineeringStructureControls,
+  engineeringWorldActuatorControls,
+} from "./panels/simControlSchema";
 import {
   DebugSettings,
   EnvironmentPreset,
@@ -128,332 +134,18 @@ export function EngineeringPanel({
               { label: "Field Gusty", value: "field_gusty" },
             ]}
           />
-          <Slider
-            label="Ambient Temperature"
-            value={simSettings.ambientTempC}
-            min={-10}
-            max={45}
-            step={1}
-            unit=" C"
-            onChange={(value) => updateSimSetting("ambientTempC", value)}
-          />
-          <Slider
-            label="Humidity"
-            value={simSettings.humidityPct}
-            min={0}
-            max={100}
-            step={5}
-            unit="%"
-            onChange={(value) => updateSimSetting("humidityPct", value)}
-          />
-          <Slider
-            label="Mean Wind"
-            value={simSettings.meanWindMS}
-            min={0}
-            max={20}
-            step={0.2}
-            unit=" m/s"
-            onChange={(value) => updateSimSetting("meanWindMS", value)}
-          />
-          <Slider
-            label="Gust Amplitude"
-            value={simSettings.gustAmplitudeMS}
-            min={0}
-            max={10}
-            step={0.1}
-            unit=" m/s"
-            onChange={(value) => updateSimSetting("gustAmplitudeMS", value)}
-          />
-          <Slider
-            label="Turbulence"
-            value={simSettings.turbulenceMS}
-            min={0}
-            max={5}
-            step={0.05}
-            unit=" m/s"
-            onChange={(value) => updateSimSetting("turbulenceMS", value)}
-          />
-          <Slider
-            label="ESC Latency"
-            value={simSettings.escLatencyMs}
-            min={0}
-            max={120}
-            step={2}
-            unit=" ms"
-            onChange={(value) => updateSimSetting("escLatencyMs", value)}
-          />
-          <Slider
-            label="Actuator Mismatch"
-            value={simSettings.actuatorMismatchPct}
-            min={0}
-            max={20}
-            step={0.5}
-            unit="%"
-            onChange={(value) => updateSimSetting("actuatorMismatchPct", value)}
-          />
-          <Slider
-            label="Current Limit"
-            value={simSettings.motorCurrentLimitA}
-            min={20}
-            max={220}
-            step={5}
-            unit=" A"
-            onChange={(value) => updateSimSetting("motorCurrentLimitA", value)}
-          />
-          <Slider
-            label="Motor Cooling"
-            value={simSettings.motorCoolingScale}
-            min={0.3}
-            max={2}
-            step={0.05}
-            unit="x"
-            onChange={(value) => updateSimSetting("motorCoolingScale", value)}
-          />
-          <Slider
-            label="Motor KV"
-            value={simSettings.buildMotorKV}
-            min={500}
-            max={4200}
-            step={10}
-            unit=" kv"
-            onChange={(value) => updateSimSetting("buildMotorKV", value)}
-          />
-          <Slider
-            label="Battery Cells"
-            value={simSettings.buildBatteryCells}
-            min={3}
-            max={8}
-            step={1}
-            unit=" s"
-            onChange={(value) => updateSimSetting("buildBatteryCells", value)}
-          />
-          <Slider
-            label="Prop Pitch"
-            value={simSettings.buildPropPitchIn}
-            min={2}
-            max={8}
-            step={0.1}
-            unit=' in'
-            onChange={(value) => updateSimSetting("buildPropPitchIn", value)}
-          />
-          <Slider
-            label="Pack Resistance"
-            value={simSettings.buildPackResistanceMilliOhm}
-            min={4}
-            max={80}
-            step={1}
-            unit=" mOhm"
-            onChange={(value) => updateSimSetting("buildPackResistanceMilliOhm", value)}
-          />
-          <Slider
-            label="Rotor Inertia"
-            value={simSettings.rotorInertiaScale}
-            min={0.35}
-            max={3}
-            step={0.01}
-            unit="x"
-            onChange={(value) => updateSimSetting("rotorInertiaScale", value)}
-          />
-          <Slider
-            label="Acro Rate"
-            value={simSettings.acroRateDegPerSec}
-            min={360}
-            max={1400}
-            step={10}
-            unit=" deg/s"
-            onChange={(value) => updateSimSetting("acroRateDegPerSec", value)}
-          />
-          <Slider
-            label="Acro Expo"
-            value={simSettings.acroExpo}
-            min={0}
-            max={0.75}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("acroExpo", value)}
-          />
-          <Slider
-            label="Air-Mode Authority"
-            value={simSettings.airmodeStrength}
-            min={0}
-            max={1}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("airmodeStrength", value)}
-          />
-          <Slider
-            label="Prop-Wash Coupling"
-            value={simSettings.propWashCoupling}
-            min={0}
-            max={1}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("propWashCoupling", value)}
+          <SimSettingsSliderList
+            controls={engineeringWorldActuatorControls}
+            simSettings={simSettings}
+            onChange={patchSimSettings}
           />
         </ControlGroup>
 
         <ControlGroup title="Structure & Wiring">
-          <Slider
-            label="Manufacturing Tolerance"
-            value={simSettings.manufacturingToleranceMm}
-            min={0.01}
-            max={0.5}
-            step={0.01}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("manufacturingToleranceMm", value)}
-          />
-          <Slider
-            label="Material Density"
-            value={simSettings.materialDensityGcm3}
-            min={1}
-            max={2.2}
-            step={0.01}
-            unit=" g/cc"
-            onChange={(value) => updateSimSetting("materialDensityGcm3", value)}
-          />
-          <Slider
-            label="Elastic Modulus"
-            value={simSettings.materialElasticModulusGPa}
-            min={20}
-            max={140}
-            step={1}
-            unit=" GPa"
-            onChange={(value) => updateSimSetting("materialElasticModulusGPa", value)}
-          />
-          <Slider
-            label="Yield Strength"
-            value={simSettings.materialYieldStrengthMPa}
-            min={120}
-            max={1200}
-            step={10}
-            unit=" MPa"
-            onChange={(value) => updateSimSetting("materialYieldStrengthMPa", value)}
-          />
-          <Slider
-            label="Brittle Strain Limit"
-            value={simSettings.materialBrittleStrainPct}
-            min={0.2}
-            max={3}
-            step={0.01}
-            unit=" %"
-            onChange={(value) => updateSimSetting("materialBrittleStrainPct", value)}
-          />
-          <Slider
-            label="Impact Fragility"
-            value={simSettings.impactFragilityScale}
-            min={0.25}
-            max={3}
-            step={0.01}
-            unit="x"
-            onChange={(value) => updateSimSetting("impactFragilityScale", value)}
-          />
-          <Slider
-            label="Wire Outer Diameter"
-            value={simSettings.wireOuterDiameterMm}
-            min={0.6}
-            max={4}
-            step={0.05}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("wireOuterDiameterMm", value)}
-          />
-          <Slider
-            label="Harness Conductors"
-            value={simSettings.wiringBundleCount}
-            min={1}
-            max={24}
-            step={1}
-            unit=""
-            onChange={(value) => updateSimSetting("wiringBundleCount", value)}
-          />
-          <Slider
-            label="Wire Keepout"
-            value={simSettings.wiringMinSpacingMm}
-            min={1}
-            max={12}
-            step={0.1}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("wiringMinSpacingMm", value)}
-          />
-          <Slider
-            label="Harness Current"
-            value={simSettings.wiringCurrentA}
-            min={1}
-            max={180}
-            step={1}
-            unit=" A"
-            onChange={(value) => updateSimSetting("wiringCurrentA", value)}
-          />
-          <Slider
-            label="Motor Screw Clearance"
-            value={simSettings.motorScrewClearanceMm}
-            min={0.05}
-            max={1}
-            step={0.01}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("motorScrewClearanceMm", value)}
-          />
-          <Slider
-            label="Stack Screw Clearance"
-            value={simSettings.stackScrewClearanceMm}
-            min={0.05}
-            max={1}
-            step={0.01}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("stackScrewClearanceMm", value)}
-          />
-          <Slider
-            label="Camera TPU Clearance"
-            value={simSettings.cameraTpuClearanceMm}
-            min={0.1}
-            max={2}
-            step={0.01}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("cameraTpuClearanceMm", value)}
-          />
-          <Slider
-            label="Antenna Tube Clearance"
-            value={simSettings.antennaTubeClearanceMm}
-            min={0.1}
-            max={2}
-            step={0.01}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("antennaTubeClearanceMm", value)}
-          />
-          <Slider
-            label="Stack Height"
-            value={simSettings.stackHeightMm}
-            min={4}
-            max={30}
-            step={0.5}
-            unit=" mm"
-            onChange={(value) => updateSimSetting("stackHeightMm", value)}
-          />
-          <Slider
-            label="Arm Fracture Threshold"
-            value={simSettings.armFractureForceN}
-            min={80}
-            max={2000}
-            step={10}
-            unit=" N"
-            onChange={(value) => updateSimSetting("armFractureForceN", value)}
-          />
-          <Slider
-            label="Motor Damage Threshold"
-            value={simSettings.motorDamageForceN}
-            min={40}
-            max={1200}
-            step={10}
-            unit=" N"
-            onChange={(value) => updateSimSetting("motorDamageForceN", value)}
-          />
-          <Slider
-            label="Battery Damage Threshold"
-            value={simSettings.batteryDamageForceN}
-            min={60}
-            max={1600}
-            step={10}
-            unit=" N"
-            onChange={(value) => updateSimSetting("batteryDamageForceN", value)}
+          <SimSettingsSliderList
+            controls={engineeringStructureControls}
+            simSettings={simSettings}
+            onChange={patchSimSettings}
           />
         </ControlGroup>
 
@@ -469,77 +161,10 @@ export function EngineeringPanel({
               { label: "Betaflight", value: "betaflight" },
             ]}
           />
-          <Slider
-            label="BF RC Rate"
-            value={simSettings.betaflightRcRate}
-            min={0.2}
-            max={3}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("betaflightRcRate", value)}
-          />
-          <Slider
-            label="BF Super Rate"
-            value={simSettings.betaflightSuperRate}
-            min={0}
-            max={0.95}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("betaflightSuperRate", value)}
-          />
-          <Slider
-            label="BF Expo"
-            value={simSettings.betaflightExpo}
-            min={0}
-            max={0.95}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("betaflightExpo", value)}
-          />
-          <Slider
-            label="BF Yaw RC Rate"
-            value={simSettings.betaflightYawRcRate}
-            min={0.2}
-            max={3}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("betaflightYawRcRate", value)}
-          />
-          <Slider
-            label="BF Yaw Super"
-            value={simSettings.betaflightYawSuperRate}
-            min={0}
-            max={0.95}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("betaflightYawSuperRate", value)}
-          />
-          <Slider
-            label="BF Yaw Expo"
-            value={simSettings.betaflightYawExpo}
-            min={0}
-            max={0.95}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("betaflightYawExpo", value)}
-          />
-          <Slider
-            label="Throttle Mid"
-            value={simSettings.throttleMid01}
-            min={0.05}
-            max={0.95}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("throttleMid01", value)}
-          />
-          <Slider
-            label="Throttle Expo"
-            value={simSettings.throttleExpo}
-            min={0}
-            max={0.95}
-            step={0.01}
-            unit=""
-            onChange={(value) => updateSimSetting("throttleExpo", value)}
+          <SimSettingsSliderList
+            controls={engineeringRateControls}
+            simSettings={simSettings}
+            onChange={patchSimSettings}
           />
           <div>
             <label className="ui-label mb-1.5 block">Tune Import</label>
@@ -622,32 +247,10 @@ export function EngineeringPanel({
             checked={simSettings.rangefinderEnabled}
             onChange={(checked) => updateSimSetting("rangefinderEnabled", checked)}
           />
-          <Slider
-            label="Sensor Noise"
-            value={simSettings.sensorNoiseScale}
-            min={0}
-            max={2}
-            step={0.05}
-            unit="x"
-            onChange={(value) => updateSimSetting("sensorNoiseScale", value)}
-          />
-          <Slider
-            label="GPS Update Rate"
-            value={simSettings.gpsRateHz}
-            min={1}
-            max={20}
-            step={1}
-            unit=" Hz"
-            onChange={(value) => updateSimSetting("gpsRateHz", value)}
-          />
-          <Slider
-            label="Recorder Window"
-            value={simSettings.sensorLogSeconds}
-            min={10}
-            max={180}
-            step={5}
-            unit=" s"
-            onChange={(value) => updateSimSetting("sensorLogSeconds", value)}
+          <SimSettingsSliderList
+            controls={engineeringSensorControls}
+            simSettings={simSettings}
+            onChange={patchSimSettings}
           />
         </ControlGroup>
 
