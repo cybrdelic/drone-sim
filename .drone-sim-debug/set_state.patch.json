@@ -1,4 +1,0 @@
-{
-  "params": { "viewMode": "flight_sim" },
-  "debugSettings": { "flightTelemetry": true, "physicsLines": true }
-}

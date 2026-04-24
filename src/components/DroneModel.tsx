@@ -2,19 +2,46 @@ import { Html } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
 import React, { memo, useDeferredValue, useMemo, useRef } from "react";
 import * as THREE from "three";
-import { ADDITION, Brush, Evaluator, SUBTRACTION } from "three-bvh-csg";
-import { DroneParams, FlightTelemetry, SimSettings, ViewSettings } from "../types";
-
-function boxInertiaDiagKgM2(massKg: number, sizeM: THREE.Vector3) {
-  const x = sizeM.x;
-  const y = sizeM.y;
-  const z = sizeM.z;
-  return new THREE.Vector3(
-    (1 / 12) * massKg * (y * y + z * z),
-    (1 / 12) * massKg * (x * x + z * z),
-    (1 / 12) * massKg * (x * x + y * y),
-  );
-}
+import { DronePhysicsBody } from "./DronePhysicsBody";
+import { useMotorAudio } from "../hooks/useMotorAudio";
+import type { DroneRapierComponents, DroneRigidBodyRef } from "../physics/rapierBundle";
+import { applyWireframeToScene } from "../scene/wireframe";
+import { defaultSimSettings } from "../sim/config";
+import {
+  applyDeadzone,
+  clamp01,
+  clamp11,
+  createFlightKeyState,
+  mapBetaflightRateDegPerSec,
+  mapFlightKey,
+  resetFlightKeyState,
+  shapeCenteredCurve,
+  shapeThrottleCurve,
+} from "../sim/flight/control";
+import { buildPropulsionModel } from "../sim/flight/propulsion";
+import {
+  createResetFlightTelemetry,
+  createSimSettingsTelemetrySnapshot,
+} from "../sim/flight/telemetry";
+import { mulMat3Vec, solve4x4 } from "../sim/flightMath";
+import {
+  buildDroneGeometry,
+  buildMotorTuple,
+  computeClearanceData,
+  createCsgEvaluator,
+  motorIndices,
+  type MotorTuple,
+  type Point3,
+} from "../sim/geometry/droneGeometry";
+import { computeDroneMassProperties } from "../sim/geometry/droneMass";
+import {
+  buildMotorHealthScales,
+  computeWindField,
+  evaluateAtmosphere,
+  magneticFieldWorldVector,
+  pressureToAltitudeM,
+} from "../sim/labModels";
+import { DroneParams, FlightTelemetry, InspectTarget, SimSettings, ViewSettings } from "../types";
 
 function Annotation({
   title,
@@ -48,27 +75,73 @@ function Annotation({
   );
 }
 
+function InvalidPartOverlay({
+  visible,
+  position,
+  size,
+  rotation = [0, 0, 0],
+}: {
+  visible: boolean;
+  position: [number, number, number];
+  size: [number, number, number];
+  rotation?: [number, number, number];
+}) {
+  if (!visible) return null;
+
+  return (
+    <mesh position={position} rotation={rotation} renderOrder={50}>
+      <boxGeometry args={size} />
+      <meshBasicMaterial
+        color="#ef4444"
+        transparent
+        opacity={0.2}
+        depthWrite={false}
+        depthTest={false}
+      />
+    </mesh>
+  );
+}
+
 interface DroneModelProps {
   params: DroneParams;
   viewSettings?: ViewSettings;
   simSettings?: SimSettings;
+  invalidTargets?: InspectTarget[];
   groupRef: React.RefObject<THREE.Group | null>;
   flightTelemetryRef?: React.MutableRefObject<FlightTelemetry>;
   resetToken?: number;
-  rapier?: {
-    RigidBody: React.ComponentType<any>;
-    CuboidCollider: React.ComponentType<any>;
-  };
+  rapier?: DroneRapierComponents;
   waypoints?: THREE.Vector3[];
   isFlyingPath?: boolean;
   onFlightComplete?: () => void;
   controlSensitivity?: number;
+  onRuntimeIssue?: (
+    kind: "controller" | "physics",
+    message: string | null,
+  ) => void;
 }
+
+type RapierVectorLike = { x: number; y: number; z: number };
+type CollisionPayloadLike = {
+  flipped?: boolean;
+  manifold?: {
+    numSolverContacts?: () => number;
+    solverContactPoint?: (index: number) => RapierVectorLike;
+    normal?: () => RapierVectorLike;
+  };
+};
+type ContactForcePayloadLike = {
+  totalForce?: RapierVectorLike;
+  totalForceMagnitude?: number;
+  maxForceDirection?: RapierVectorLike;
+  maxForceMagnitude?: number;
+};
 
 export const DroneModel = memo(function DroneModel({
   params,
   viewSettings,
   simSettings,
+  invalidTargets = [],
   groupRef,
   flightTelemetryRef,
   resetToken = 0,
@@ -77,12 +150,15 @@ export const DroneModel = memo(function DroneModel({
   isFlyingPath = false,
   onFlightComplete,
   controlSensitivity = 0.45,
+  onRuntimeIssue,
 }: DroneModelProps) {
   const effectiveViewSettings: ViewSettings =
     viewSettings ??
     ({
       wireframe: false,
       focus: "all",
+      inspectTarget: "all",
+      keepContext: true,
       visibility: {
         frame: true,
         propulsion: true,
@@ -91,13 +167,7 @@ export const DroneModel = memo(function DroneModel({
       },
     } as ViewSettings);
 
-  const effectiveSimSettings: SimSettings =
-    simSettings ??
-    ({
-      motorAudioEnabled: false,
-      motorAudioVolume: 0.35,
-      vibrationAmount: 0.35,
-    } as SimSettings);
+  const effectiveSimSettings: SimSettings = simSettings ?? defaultSimSettings;
 
   const deferredParams = useDeferredValue(params);
 
@@ -118,28 +188,19 @@ export const DroneModel = memo(function DroneModel({
   } = deferredParams;
 
   const propGroupRefs = useRef<Array<THREE.Group | null>>([]);
-  const propSpinRad = useRef<number[]>([0, 0, 0, 0]);
-  const flightBodyRef = useRef<any>(null);
+  const motorAssemblyRefs = useRef<Array<THREE.Group | null>>([]);
+  const propSpinRad = useRef<MotorTuple<number>>([0, 0, 0, 0]);
+  const flightBodyRef = useRef<DroneRigidBodyRef>(null);
   const flightInitDone = useRef(false);
 
   const visualJitterRef = useRef<THREE.Group | null>(null);
 
-  const audioRef = useRef<{
-    ctx: AudioContext;
-    master: GainNode;
-    motorOsc: OscillatorNode[];
-    motorGain: GainNode[];
-    noiseSrc: AudioBufferSourceNode;
-    noiseGain: GainNode;
-    noiseHp: BiquadFilterNode;
-  } | null>(null);
-
-  const audioTelemetry = useRef({
-    omegaRad: [0, 0, 0, 0] as number[],
-    omegaMaxRad: 1 as number,
-    mechPowerW: 0 as number,
-    thrustTotalN: 0 as number,
-  });
+  const controllerRuntimeIssueRef = useRef(false);
+  const physicsRuntimeIssueRef = useRef(false);
+  const { audioTelemetry, updateMotorAudio } = useMotorAudio(
+    effectiveSimSettings,
+    viewMode,
+  );
 
   // Materials
   const carbonMaterial = useMemo(
@@ -158,29 +219,6 @@ export const DroneModel = memo(function DroneModel({
         color: "#e11d48", // Anodized Red
         roughness: 0.3,
         metalness: 0.8,
-      }),
-    [],
-  );
-
-  const propMaterial = useMemo(
-    () =>
-      new THREE.MeshStandardMaterial({
-        color: "#10b981", // Emerald green
-        transparent: true,
-        opacity: 0.2,
-        roughness: 0.1,
-        metalness: 0.1,
-        side: THREE.DoubleSide,
-      }),
-    [],
-  );
-
-  const fcMaterial = useMemo(
-    () =>
-      new THREE.MeshStandardMaterial({
-        color: "#262626", // Dark grey PCB
-        roughness: 0.9,
-        metalness: 0.1,
       }),
     [],
   );
@@ -296,312 +334,67 @@ export const DroneModel = memo(function DroneModel({
     return geo;
   }, [propSize]);
 
-  const evaluator = useMemo(() => {
-    const ev = new Evaluator();
-    ev.useGroups = false;
-    return ev;
-  }, []);
+  const evaluator = useMemo(() => createCsgEvaluator(), []);
 
-  // Generate Geometry
   const { bottomPlateGeo, topPlateGeo, standoffsData, motorPositions } =
-    useMemo(() => {
-      const centerRadius = fcMounting / 2 + 10;
-      const armLength = frameSize / 2;
-      const motorPadRadius = motorMountPattern / 2 + 3.5;
-      const screwHoleRadius = motorMountPattern >= 16 ? 1.6 : 1.1; // M3 vs M2
-      const mPositions: [number, number, number][] = [];
-
-      // --- 1. BOTTOM PLATE (Unibody) ---
-      // Central Body
-      const baseGeo = new THREE.CylinderGeometry(
-        centerRadius,
-        centerRadius,
+    useMemo(
+      () =>
+        buildDroneGeometry(
+          {
+            armWidth,
+            fcMounting,
+            frameSize,
+            motorCenterHole,
+            motorMountPattern,
+            plateThickness,
+            topPlateThickness,
+            weightReduction,
+          },
+          evaluator,
+        ),
+      [
+        armWidth,
+        evaluator,
+        fcMounting,
+        frameSize,
+        motorCenterHole,
+        motorMountPattern,
         plateThickness,
-        32,
-      );
-      let bottomBrush = new Brush(baseGeo);
-      bottomBrush.position.y = plateThickness / 2;
-      bottomBrush.updateMatrixWorld();
-
-      // Arms & Motor Pads
-      for (let i = 0; i < 4; i++) {
-        const angle = i * (Math.PI / 2) + Math.PI / 4;
-        const cX = Math.cos(angle) * (armLength / 2);
-        const cZ = Math.sin(angle) * (armLength / 2);
-
-        // Arm
-        const armGeo = new THREE.BoxGeometry(
-          armWidth,
-          plateThickness,
-          armLength,
-        );
-        const armBrush = new Brush(armGeo);
-        armBrush.position.set(cX, plateThickness / 2, cZ);
-        armBrush.lookAt(cX * 2, plateThickness / 2, cZ * 2);
-        armBrush.updateMatrixWorld();
-        bottomBrush = evaluator.evaluate(bottomBrush, armBrush, ADDITION);
-
-        // Motor Pad
-        const mX = Math.cos(angle) * armLength;
-        const mZ = Math.sin(angle) * armLength;
-        mPositions.push([mX, plateThickness, mZ]);
-
-        const padGeo = new THREE.CylinderGeometry(
-          motorPadRadius,
-          motorPadRadius,
-          plateThickness,
-          32,
-        );
-        const padBrush = new Brush(padGeo);
-        padBrush.position.set(mX, plateThickness / 2, mZ);
-        padBrush.updateMatrixWorld();
-        bottomBrush = evaluator.evaluate(bottomBrush, padBrush, ADDITION);
-      }
-
-      // Subtractions (Holes)
-      const holesToSubtract: Brush[] = [];
-
-      // FC Stack Holes
-      const fcOffset = fcMounting / 2;
-      const fcHoleGeo = new THREE.CylinderGeometry(
-        1.6,
-        1.6,
-        plateThickness * 4,
-        16,
-      );
-      for (const dx of [-1, 1]) {
-        for (const dz of [-1, 1]) {
-          const fcHole = new Brush(fcHoleGeo);
-          fcHole.position.set(dx * fcOffset, plateThickness / 2, dz * fcOffset);
-          fcHole.updateMatrixWorld();
-          holesToSubtract.push(fcHole);
-        }
-      }
-
-      // Motor Holes & Weight Reduction
-      for (let i = 0; i < 4; i++) {
-        const angle = i * (Math.PI / 2) + Math.PI / 4;
-        const mX = Math.cos(angle) * armLength;
-        const mZ = Math.sin(angle) * armLength;
-
-        // Center Shaft Hole
-        const cHole = new Brush(
-          new THREE.CylinderGeometry(
-            motorCenterHole / 2,
-            motorCenterHole / 2,
-            plateThickness * 4,
-            16,
-          ),
-        );
-        cHole.position.set(mX, plateThickness / 2, mZ);
-        cHole.updateMatrixWorld();
-        holesToSubtract.push(cHole);
-
-        // Motor Screw Holes (4 per motor)
-        for (let j = 0; j < 4; j++) {
-          const sAngle = j * (Math.PI / 2);
-          const sX = mX + Math.cos(sAngle) * (motorMountPattern / 2);
-          const sZ = mZ + Math.sin(sAngle) * (motorMountPattern / 2);
-          const sHole = new Brush(
-            new THREE.CylinderGeometry(
-              screwHoleRadius,
-              screwHoleRadius,
-              plateThickness * 4,
-              16,
-            ),
-          );
-          sHole.position.set(sX, plateThickness / 2, sZ);
-          sHole.updateMatrixWorld();
-          holesToSubtract.push(sHole);
-        }
-
-        // Arm Weight Reduction Cutouts
-        if (weightReduction > 0) {
-          const cutoutWidth = armWidth * (weightReduction / 100) * 0.7;
-          const cutoutLength = armLength * 0.5;
-          if (cutoutWidth > 2) {
-            const cutoutGeo = new THREE.CapsuleGeometry(
-              cutoutWidth / 2,
-              cutoutLength,
-              8,
-              16,
-            );
-            cutoutGeo.rotateX(Math.PI / 2);
-            const cutout = new Brush(cutoutGeo);
-            const cX_cut = Math.cos(angle) * (armLength * 0.45);
-            const cZ_cut = Math.sin(angle) * (armLength * 0.45);
-            cutout.position.set(cX_cut, plateThickness / 2, cZ_cut);
-            cutout.lookAt(cX_cut * 2, plateThickness / 2, cZ_cut * 2);
-            cutout.updateMatrixWorld();
-            holesToSubtract.push(cutout);
-          }
-        }
-      }
-
-      for (const hole of holesToSubtract) {
-        bottomBrush = evaluator.evaluate(bottomBrush, hole, SUBTRACTION);
-      }
-
-      // --- 2. TOP PLATE ---
-      // Create a rounded rectangle
-      const topBaseGeo = new THREE.BoxGeometry(
-        fcMounting + 12,
         topPlateThickness,
-        fcMounting + 30,
-      );
-      let topBrush = new Brush(topBaseGeo);
-      topBrush.position.y = topPlateThickness / 2;
-      topBrush.updateMatrixWorld();
+        weightReduction,
+      ],
+    );
 
-      for (const dx of [-1, 1]) {
-        for (const dz of [-1, 1]) {
-          const corner = new Brush(
-            new THREE.CylinderGeometry(6, 6, topPlateThickness, 16),
-          );
-          corner.position.set(
-            dx * (fcMounting / 2),
-            topPlateThickness / 2,
-            dz * (fcMounting / 2 + 9),
-          );
-          corner.updateMatrixWorld();
-          topBrush = evaluator.evaluate(topBrush, corner, ADDITION);
-        }
-      }
-
-      // Top Plate Subtractions
-      const topHoles: Brush[] = [];
-
-      // Standoff Screw Holes
-      for (const dx of [-1, 1]) {
-        for (const dz of [-1, 1]) {
-          const fcHole = new Brush(fcHoleGeo);
-          fcHole.position.set(
-            dx * fcOffset,
-            topPlateThickness / 2,
-            dz * fcOffset,
-          );
-          fcHole.updateMatrixWorld();
-          topHoles.push(fcHole);
-        }
-      }
-
-      // Battery Strap Slots
-      const strapGeo = new THREE.BoxGeometry(20, topPlateThickness * 4, 3);
-      for (const dz of [-centerRadius * 0.7, centerRadius * 0.7]) {
-        const strap = new Brush(strapGeo);
-        strap.position.set(0, topPlateThickness / 2, dz);
-        strap.updateMatrixWorld();
-        topHoles.push(strap);
-      }
-
-      for (const hole of topHoles) {
-        topBrush = evaluator.evaluate(topBrush, hole, SUBTRACTION);
-      }
-
-      // --- 3. STANDOFFS DATA ---
-      const standoffs = [];
-      for (const dx of [-1, 1]) {
-        for (const dz of [-1, 1]) {
-          standoffs.push([dx * fcOffset, 0, dz * fcOffset] as [
-            number,
-            number,
-            number,
-          ]);
-        }
-      }
-
-      return {
-        bottomPlateGeo: bottomBrush.geometry,
-        topPlateGeo: topBrush.geometry,
-        standoffsData: standoffs,
-        motorPositions: mPositions,
-      };
-    }, [
-      frameSize,
-      plateThickness,
-      topPlateThickness,
-      standoffHeight,
+  const clearanceData = useMemo(
+    () =>
+      computeClearanceData({
+        armWidth,
+        fcMounting,
+        motorPositions,
+        plateThickness,
+        propSize,
+        simSettings: effectiveSimSettings,
+        standoffHeight,
+        viewMode,
+      }),
+    [
       armWidth,
+      effectiveSimSettings,
       fcMounting,
-      motorMountPattern,
-      motorCenterHole,
-      weightReduction,
-      evaluator,
-    ]);
-
-  // Clearance check: compute prop-to-prop and prop-to-frame distances
-  const clearanceData = useMemo(() => {
-    if (viewMode !== "clearance_check") return null;
-    const propR = (propSize * 25.4) / 2;
-    const results: { type: string; distance: number; posA: THREE.Vector3; posB: THREE.Vector3; severity: "ok" | "warn" | "fail" }[] = [];
-
-    // Prop-to-prop clearance
-    for (let i = 0; i < motorPositions.length; i++) {
-      for (let j = i + 1; j < motorPositions.length; j++) {
-        const a = new THREE.Vector3(...motorPositions[i]);
-        const b = new THREE.Vector3(...motorPositions[j]);
-        const dist2D = Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2);
-        const gap = dist2D - 2 * propR;
-        results.push({
-          type: `Prop ${i + 1}↔${j + 1}`,
-          distance: gap,
-          posA: a,
-          posB: b,
-          severity: gap < 0 ? "fail" : gap < 3 ? "warn" : "ok",
-        });
-      }
-    }
-
-    // Prop-to-frame body clearance (prop tip to center body edge)
-    const centerRadius = fcMounting / 2 + 10;
-    for (let i = 0; i < motorPositions.length; i++) {
-      const mp = new THREE.Vector3(...motorPositions[i]);
-      const distToCenter = Math.sqrt(mp.x ** 2 + mp.z ** 2);
-      const tipInward = distToCenter - propR;
-      const gap = tipInward - centerRadius;
-      results.push({
-        type: `Prop ${i + 1}↔Body`,
-        distance: gap,
-        posA: mp,
-        posB: new THREE.Vector3(0, mp.y, 0),
-        severity: gap < 0 ? "fail" : gap < 2 ? "warn" : "ok",
-      });
-    }
-
-    // Prop-to-arm clearance: distance from prop disk edge to neighboring arm
-    for (let i = 0; i < motorPositions.length; i++) {
-      const mp = new THREE.Vector3(...motorPositions[i]);
-      for (const offset of [-1, 1]) {
-        const j = (i + offset + 4) % 4;
-        const armAngle = j * (Math.PI / 2) + Math.PI / 4;
-        const armDir = new THREE.Vector2(Math.cos(armAngle), Math.sin(armAngle));
-        const mPos2D = new THREE.Vector2(mp.x, mp.z);
-        const proj = armDir.clone().multiplyScalar(mPos2D.dot(armDir));
-        const perpDist = mPos2D.clone().sub(proj).length();
-        const gap = perpDist - propR - armWidth / 2;
-        if (gap < 5) {
-          results.push({
-            type: `Prop ${i + 1}↔Arm ${j + 1}`,
-            distance: gap,
-            posA: mp,
-            posB: new THREE.Vector3(proj.x, mp.y, proj.y),
-            severity: gap < 0 ? "fail" : gap < 2 ? "warn" : "ok",
-          });
-        }
-      }
-    }
-
-    return results;
-  }, [viewMode, propSize, motorPositions, fcMounting, armWidth]);
+      motorPositions,
+      plateThickness,
+      propSize,
+      standoffHeight,
+      viewMode,
+    ],
+  );
 
   const bottomPlateTopY = plateThickness;
   const bottomPlateMinY = 0;
   const topPlateTopY = topPlateThickness;
-  const centerRadius = fcMounting / 2 + 10;
   const motorPadRadius = motorMountPattern / 2 + 3.5;
   const bottomPlateSpan = Math.SQRT1_2 * frameSize + motorPadRadius * 2 + 12;
   const topPlateWidth = fcMounting + 12;
-  const topPlateDepth = fcMounting + 30;
   const carbonSheetSize = Math.max(
     300,
     Math.ceil(bottomPlateSpan + topPlateWidth + 72),
@@ -658,359 +451,57 @@ export const DroneModel = memo(function DroneModel({
     showStandoffs = false;
   }
 
-  // Flight Simulator Logic
-  const keys = useRef({
-    w: false,
-    a: false,
-    s: false,
-    d: false,
-    space: false,
-    shift: false,
-    q: false,
-    e: false,
-  });
+  const keys = useRef(createFlightKeyState());
 
-  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
-  const clamp11 = (v: number) => Math.max(-1, Math.min(1, v));
-  const applyDeadzone = (x: number, dz: number) => {
-    const ax = Math.abs(x);
-    if (ax <= dz) return 0;
-    const t = (ax - dz) / (1 - dz);
-    return Math.sign(x) * t;
+  const setKeyState = (keyName: keyof typeof keys.current, next: boolean) => {
+    keys.current[keyName] = next;
+  };
+
+  const resetKeyState = () => {
+    resetFlightKeyState(keys.current);
+  };
+
+  const blurActiveFlightControl = () => {
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement && activeElement !== document.body) {
+      activeElement.blur();
+    }
   };
 
   React.useEffect(() => {
-    // Wireframe toggle for all materials (including inline materials).
     if (!groupRef.current) return;
-    groupRef.current.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      if (!mesh.isMesh) return;
-      const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
-      if (!material) return;
-      const apply = (m: THREE.Material) => {
-        const anyMat = m as any;
-        if (typeof anyMat.wireframe === "boolean") {
-          anyMat.wireframe = effectiveViewSettings.wireframe;
-          m.needsUpdate = true;
-        }
-      };
-      if (Array.isArray(material)) material.forEach(apply);
-      else apply(material);
-    });
+    applyWireframeToScene(groupRef.current, effectiveViewSettings.wireframe);
   }, [groupRef, effectiveViewSettings.wireframe]);
 
-  React.useEffect(() => {
-    // Create/tear down motor audio nodes.
-    if (!effectiveSimSettings.motorAudioEnabled) {
-      if (audioRef.current) {
-        try {
-          audioRef.current.motorOsc.forEach((o) => o.stop());
-          audioRef.current.noiseSrc.stop();
-          audioRef.current.ctx.close();
-        } catch {
-          // ignore
-        }
-        audioRef.current = null;
-      }
-      return;
-    }
-
-    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
-
-    const ctx: AudioContext = new AudioCtx({ latencyHint: "interactive" });
-    void ctx.resume().catch(() => {
-      // Autoplay policies: user interaction is still required.
-    });
-
-    const master = ctx.createGain();
-    master.gain.value = 0.0001;
-    master.connect(ctx.destination);
-
-    const motorOsc: OscillatorNode[] = [];
-    const motorGain: GainNode[] = [];
-    for (let i = 0; i < 4; i++) {
-      const osc = ctx.createOscillator();
-      osc.type = "sine";
-      osc.frequency.value = 60;
-      const g = ctx.createGain();
-      g.gain.value = 0;
-      osc.connect(g);
-      g.connect(master);
-      osc.start();
-      motorOsc.push(osc);
-      motorGain.push(g);
-    }
-
-    // Broadband noise component for "whoosh" / turbulence.
-    const noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
-    const data = noiseBuf.getChannelData(0);
-    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
-    const noiseSrc = ctx.createBufferSource();
-    noiseSrc.buffer = noiseBuf;
-    noiseSrc.loop = true;
-
-    const noiseHp = ctx.createBiquadFilter();
-    noiseHp.type = "highpass";
-    noiseHp.frequency.value = 400;
-    noiseHp.Q.value = 0.7;
-
-    const noiseGain = ctx.createGain();
-    noiseGain.gain.value = 0;
-
-    noiseSrc.connect(noiseHp);
-    noiseHp.connect(noiseGain);
-    noiseGain.connect(master);
-    noiseSrc.start();
-
-    audioRef.current = { ctx, master, motorOsc, motorGain, noiseSrc, noiseGain, noiseHp };
-
-    return () => {
-      if (!audioRef.current) return;
-      try {
-        audioRef.current.motorOsc.forEach((o) => o.stop());
-        audioRef.current.noiseSrc.stop();
-        audioRef.current.ctx.close();
-      } catch {
-        // ignore
-      }
-      audioRef.current = null;
-    };
-  }, [effectiveSimSettings.motorAudioEnabled]);
-
-  const massProps = useMemo(() => {
-    const mmToM = 1e-3;
-    const carbonDensityKgM3 = 1600;
-    const mm3ToM3 = 1e-9;
-    const centerRadius = fcMounting / 2 + 10;
-    const armLength = frameSize / 2;
-    const motorPadRadius = motorMountPattern / 2 + 3.5;
-    const screwHoleRadius = motorMountPattern >= 16 ? 1.6 : 1.1;
-    const fcHoleRadius = 1.6;
-    const topPlateWidthMm = fcMounting + 12;
-    const topPlateDepthMm = fcMounting + 30;
-    const topCornerRadiusMm = 6;
-
-    const centerAreaMm2 = Math.PI * centerRadius * centerRadius;
-    const armAreaMm2 = 4 * armWidth * armLength * 0.82;
-    const motorPadAreaMm2 = 4 * Math.PI * motorPadRadius * motorPadRadius;
-    const fcHolesAreaMm2 = 4 * Math.PI * fcHoleRadius * fcHoleRadius;
-    const motorHolesAreaMm2 =
-      4 * Math.PI * Math.pow(motorCenterHole / 2, 2) +
-      16 * Math.PI * screwHoleRadius * screwHoleRadius;
-    const cutoutWidthMm = armWidth * (weightReduction / 100) * 0.7;
-    const cutoutLengthMm = armLength * 0.5;
-    const cutoutAreaMm2 =
-      weightReduction > 0 && cutoutWidthMm > 2
-        ? 4 * cutoutWidthMm * cutoutLengthMm * 0.72
-        : 0;
-
-    const bottomAreaMm2 = Math.max(
-      centerAreaMm2 + armAreaMm2 + motorPadAreaMm2 - fcHolesAreaMm2 - motorHolesAreaMm2 - cutoutAreaMm2,
-      centerAreaMm2,
-    );
-
-    const roundedRectAreaMm2 =
-      topPlateWidthMm * topPlateDepthMm -
-      (4 - Math.PI) * topCornerRadiusMm * topCornerRadiusMm;
-    const strapSlotAreaMm2 = 2 * 20 * 3;
-    const topAreaMm2 = Math.max(
-      roundedRectAreaMm2 - fcHolesAreaMm2 - strapSlotAreaMm2,
-      roundedRectAreaMm2 * 0.7,
-    );
-
-    const bottomMassKg = bottomAreaMm2 * plateThickness * mm3ToM3 * carbonDensityKgM3;
-    const topMassKg = topAreaMm2 * topPlateThickness * mm3ToM3 * carbonDensityKgM3;
-
-    const bottomPlate = {
-      massKg: bottomMassKg,
-      comMm: new THREE.Vector3(0, plateThickness / 2, 0),
-      inertiaKgM2_aboutCOM: (() => {
-        const bottomSpanMm = Math.SQRT1_2 * frameSize + motorPadRadius * 2;
-        const inertiaDiag = boxInertiaDiagKgM2(
-          bottomMassKg,
-          new THREE.Vector3(bottomSpanMm * mmToM, plateThickness * mmToM, bottomSpanMm * mmToM),
-        );
-        return new THREE.Matrix3().set(
-          inertiaDiag.x, 0, 0,
-          0, inertiaDiag.y, 0,
-          0, 0, inertiaDiag.z,
-        );
-      })(),
-    };
-
-    const topPlate = {
-      massKg: topMassKg,
-      comMm: new THREE.Vector3(0, topPlateThickness / 2, 0),
-      inertiaKgM2_aboutCOM: (() => {
-        const inertiaDiag = boxInertiaDiagKgM2(
-          topMassKg,
-          new THREE.Vector3(topPlateWidthMm * mmToM, topPlateThickness * mmToM, topPlateDepthMm * mmToM),
-        );
-        return new THREE.Matrix3().set(
-          inertiaDiag.x, 0, 0,
-          0, inertiaDiag.y, 0,
-          0, 0, inertiaDiag.z,
-        );
-      })(),
-    };
-
-    // Assembled offsets (mm)
-    const bottomOffsetMm = new THREE.Vector3(0, 0, 0);
-    const topOffsetMm = new THREE.Vector3(0, plateThickness + standoffHeight, 0);
-
-    const bottomComMm = bottomPlate.comMm.clone().add(bottomOffsetMm);
-    const topComMm = topPlate.comMm.clone().add(topOffsetMm);
-
-    // Other components as point masses.
-    const motorMassKg = (propSize >= 7 ? 45 : propSize >= 5 ? 32 : 12) / 1000;
-    const batteryMassKg = (propSize >= 7 ? 250 : propSize >= 5 ? 180 : 65) / 1000;
-    const stackMassKg = 18 / 1000;
-    const propMassKg = (propSize * 0.8) / 1000;
-    const miscMassKg = 20 / 1000;
-
-    const motorTotalMassKg = (motorMassKg + propMassKg) * 4;
-
-    const batteryPosMm = new THREE.Vector3(
-      0,
-      topOffsetMm.y + topPlateThickness + 15,
-      0,
-    );
-    const stackPosMm = new THREE.Vector3(0, plateThickness + 10, 0);
-    const motorPosMm = motorPositions.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
-
-    const totalMassKg = Math.max(
-      0.05,
-      bottomPlate.massKg +
-        topPlate.massKg +
-        motorTotalMassKg +
-        batteryMassKg +
-        stackMassKg +
-        miscMassKg,
-    );
-
-    // Total COM (mm)
-    const comMm = new THREE.Vector3(0, 0, 0);
-    comMm.add(bottomComMm.clone().multiplyScalar(bottomPlate.massKg));
-    comMm.add(topComMm.clone().multiplyScalar(topPlate.massKg));
-    comMm.add(batteryPosMm.clone().multiplyScalar(batteryMassKg));
-    comMm.add(stackPosMm.clone().multiplyScalar(stackMassKg));
-    for (const mp of motorPosMm) {
-      comMm.add(mp.clone().multiplyScalar(motorMassKg + propMassKg));
-    }
-    comMm.divideScalar(totalMassKg);
-
-    const I3 = new THREE.Matrix3().identity();
-    const addShift = (m: number, rM: THREE.Vector3) => {
-      const r2 = rM.lengthSq();
-      const rrT = new THREE.Matrix3().set(
-        rM.x * rM.x,
-        rM.x * rM.y,
-        rM.x * rM.z,
-        rM.y * rM.x,
-        rM.y * rM.y,
-        rM.y * rM.z,
-        rM.z * rM.x,
-        rM.z * rM.y,
-        rM.z * rM.z,
-      );
-      const out = I3.clone().multiplyScalar(r2);
-      {
-        const d = out.elements;
-        const s = rrT.elements;
-        for (let i = 0; i < 9; i++) d[i] -= s[i];
-      }
-      return out.multiplyScalar(m);
-    };
-
-    const addMat3InPlace = (dst: THREE.Matrix3, src: THREE.Matrix3) => {
-      const d = dst.elements;
-      const s = src.elements;
-      for (let i = 0; i < 9; i++) d[i] += s[i];
-    };
-
-    // Total inertia about total COM
-    const inertiaKgM2 = new THREE.Matrix3().set(0, 0, 0, 0, 0, 0, 0, 0, 0);
-
-    // Plates: shift each plate's inertia-about-its-own-COM to total COM.
-    {
-      const shiftB = addShift(
-        bottomPlate.massKg,
-        bottomComMm.clone().sub(comMm).multiplyScalar(mmToM),
-      );
-      const plateB = bottomPlate.inertiaKgM2_aboutCOM.clone();
-      addMat3InPlace(plateB, shiftB);
-      addMat3InPlace(inertiaKgM2, plateB);
-    }
-
-    {
-      const shiftT = addShift(
-        topPlate.massKg,
-        topComMm.clone().sub(comMm).multiplyScalar(mmToM),
-      );
-      const plateT = topPlate.inertiaKgM2_aboutCOM.clone();
-      addMat3InPlace(plateT, shiftT);
-      addMat3InPlace(inertiaKgM2, plateT);
-    }
-
-    // Point masses
-    addMat3InPlace(
-      inertiaKgM2,
-      addShift(
-        batteryMassKg,
-        batteryPosMm.clone().sub(comMm).multiplyScalar(mmToM),
-      ),
-    );
-    addMat3InPlace(
-      inertiaKgM2,
-      addShift(stackMassKg, stackPosMm.clone().sub(comMm).multiplyScalar(mmToM)),
-    );
-    for (const mp of motorPosMm) {
-      addMat3InPlace(
-        inertiaKgM2,
-        addShift(
-          motorMassKg + propMassKg,
-          mp.clone().sub(comMm).multiplyScalar(mmToM),
-        ),
-      );
-    }
-    addMat3InPlace(inertiaKgM2, addShift(miscMassKg, new THREE.Vector3(0, 0, 0)));
-
-    // Clamp diagonal to avoid singularities.
-    inertiaKgM2.elements[0] = Math.max(inertiaKgM2.elements[0], 1e-7);
-    inertiaKgM2.elements[4] = Math.max(inertiaKgM2.elements[4], 1e-7);
-    inertiaKgM2.elements[8] = Math.max(inertiaKgM2.elements[8], 1e-7);
-
-    // Invert once for angular dynamics.
-    const invInertiaKgM2 = inertiaKgM2.clone();
-    const det = invInertiaKgM2.determinant();
-    if (!Number.isFinite(det) || Math.abs(det) < 1e-18) {
-      inertiaKgM2.elements[0] += 1e-6;
-      inertiaKgM2.elements[4] += 1e-6;
-      inertiaKgM2.elements[8] += 1e-6;
-      invInertiaKgM2.copy(inertiaKgM2);
-    }
-    invInertiaKgM2.invert();
-
-    return {
-      massKg: totalMassKg,
-      comMm,
-      inertiaKgM2,
-      invInertiaKgM2,
-    };
-  }, [
-    frameSize,
-    fcMounting,
-    motorCenterHole,
-    motorMountPattern,
-    motorPositions,
-    plateThickness,
-    propSize,
-    standoffHeight,
-    topPlateThickness,
-    armWidth,
-    weightReduction,
-  ]);
+  const massProps = useMemo(
+    () =>
+      computeDroneMassProperties({
+        armWidth,
+        fcMounting,
+        frameSize,
+        motorCenterHole,
+        motorMountPattern,
+        motorPositions,
+        plateThickness,
+        simSettings: effectiveSimSettings,
+        standoffHeight,
+        topPlateThickness,
+        weightReduction,
+      }),
+    [
+      armWidth,
+      effectiveSimSettings,
+      fcMounting,
+      frameSize,
+      motorCenterHole,
+      motorMountPattern,
+      motorPositions,
+      plateThickness,
+      standoffHeight,
+      topPlateThickness,
+      weightReduction,
+    ],
+  );
 
   const flightColliderOffset: [number, number, number] = [
     -massProps.comMm.x,
@@ -1033,106 +524,24 @@ export const DroneModel = memo(function DroneModel({
     8 * assemblyHalfExtents[0] * assemblyHalfExtents[1] * assemblyHalfExtents[2];
   const colliderDensity = colliderVolumeMm3 > 0 ? massProps.massKg / colliderVolumeMm3 : 1e-7;
 
-  const propulsion = useMemo(() => {
-    const airDensityKgM3 = 1.225;
-    const diameterM = propSize * 0.0254;
+  const propulsion = useMemo(() => buildPropulsionModel(propSize, effectiveSimSettings), [
+    effectiveSimSettings.buildBatteryCells,
+    effectiveSimSettings.buildMotorKV,
+    effectiveSimSettings.buildPackResistanceMilliOhm,
+    effectiveSimSettings.buildPropPitchIn,
+    effectiveSimSettings.rotorInertiaScale,
+    propSize,
+  ]);
 
-    // Default pitch assumptions by class (edit these if you know your actual prop pitch)
-    const propPitchIn = propSize >= 7 ? 4.0 : propSize >= 5 ? 4.3 : 3.1;
-    const pitchM = propPitchIn * 0.0254;
-    const pitchRatio = diameterM > 1e-6 ? pitchM / diameterM : 0.4;
-
-    // Typical-ish coefficient ranges for small multirotor props.
-    const Ct0 = THREE.MathUtils.clamp(0.08 + 0.08 * (pitchRatio - 0.4), 0.06, 0.16);
-    const Cq0 = THREE.MathUtils.clamp(Ct0 * 0.09, 0.005, 0.03);
-
-    // Default motor KV + battery based on prop class (edit to match your build)
-    const motorKV = propSize >= 7 ? 1300 : propSize >= 5 ? 1950 : 3800;
-    const batteryCells = propSize >= 5 ? 6 : 4;
-    const vOpenPerCell = 3.85;
-    const packRintOhm = propSize >= 5 ? 0.02 : 0.028;
-    const motorEff = 0.85;
-    const motorTauSec = 0.055;
-
-    // Frame flex + tolerances
-    const staticMisalignDeg = 0.6;
-    const flexRadPerN = propSize >= 5 ? 0.00035 : 0.0006;
-    const flexTauSec = 0.08;
-
-    // IMU vib/noise
-    const imuRateNoiseStdRad = 0.03;
-    const vibRateAmpRad = 0.22;
-
-    return {
-      airDensityKgM3,
-      diameterM,
-      propPitchIn,
-      Ct0,
-      Cq0,
-      motorKV,
-      batteryCells,
-      vOpenPerCell,
-      packRintOhm,
-      motorEff,
-      motorTauSec,
-      staticMisalignDeg,
-      flexRadPerN,
-      flexTauSec,
-      imuRateNoiseStdRad,
-      vibRateAmpRad,
-    };
-  }, [propSize]);
-
-  const mulMat3Vec = (m: THREE.Matrix3, v: THREE.Vector3) => {
-    const e = m.elements;
-    return new THREE.Vector3(
-      e[0] * v.x + e[3] * v.y + e[6] * v.z,
-      e[1] * v.x + e[4] * v.y + e[7] * v.z,
-      e[2] * v.x + e[5] * v.y + e[8] * v.z,
-    );
-  };
-
-  const solve4x4 = (A: number[][], b: number[]) => {
-    // Gaussian elimination with partial pivoting. Mutates copies only.
-    const M = A.map((row) => row.slice());
-    const x = b.slice();
-
-    for (let col = 0; col < 4; col++) {
-      let pivot = col;
-      let pivotAbs = Math.abs(M[col][col]);
-      for (let r = col + 1; r < 4; r++) {
-        const v = Math.abs(M[r][col]);
-        if (v > pivotAbs) {
-          pivotAbs = v;
-          pivot = r;
-        }
-      }
-
-      if (pivotAbs < 1e-9) return null;
-
-      if (pivot !== col) {
-        const tmpRow = M[col];
-        M[col] = M[pivot];
-        M[pivot] = tmpRow;
-        const tmpX = x[col];
-        x[col] = x[pivot];
-        x[pivot] = tmpX;
-      }
-
-      const div = M[col][col];
-      for (let c = col; c < 4; c++) M[col][c] /= div;
-      x[col] /= div;
-
-      for (let r = 0; r < 4; r++) {
-        if (r === col) continue;
-        const f = M[r][col];
-        for (let c = col; c < 4; c++) M[r][c] -= f * M[col][c];
-        x[r] -= f * x[col];
-      }
-    }
-
-    return x;
-  };
+  const motorHealthScales = useMemo(
+    () => buildMotorHealthScales(effectiveSimSettings.actuatorMismatchPct),
+    [effectiveSimSettings.actuatorMismatchPct],
+  );
+  const actuatorSpreadPct = useMemo(() => {
+    const maxScale = Math.max(...motorHealthScales);
+    const minScale = Math.min(...motorHealthScales);
+    return (maxScale - minScale) * 100;
+  }, [motorHealthScales]);
 
   const flightState = useRef({
     posM: new THREE.Vector3(0, 0, 0),
@@ -1140,17 +549,56 @@ export const DroneModel = memo(function DroneModel({
     quat: new THREE.Quaternion(),
     omegaBody: new THREE.Vector3(0, 0, 0),
     armed: false as boolean,
-    motorOmegaRad: [0, 0, 0, 0] as number[],
-    motorTiltRad: [0, 0, 0, 0] as number[],
-    motorPhaseRad: [0, 0, 0, 0] as number[],
+    motorOmegaRad: [0, 0, 0, 0] as MotorTuple<number>,
+    motorTiltRad: [0, 0, 0, 0] as MotorTuple<number>,
+    motorPhaseRad: [0, 0, 0, 0] as MotorTuple<number>,
+    motorWash01: [0, 0, 0, 0] as MotorTuple<number>,
+    motorReload01: [0, 0, 0, 0] as MotorTuple<number>,
+    armDamage01: [0, 0, 0, 0] as MotorTuple<number>,
+    motorDamage01: [0, 0, 0, 0] as MotorTuple<number>,
+    batteryDamage01: 0 as number,
+    escCommand01: [0, 0, 0, 0] as MotorTuple<number>,
+    motorTempC: [20, 20, 20, 20] as MotorTuple<number>,
+    motorCurrentA: [0, 0, 0, 0] as MotorTuple<number>,
+    currentLimitScale01: [1, 1, 1, 1] as MotorTuple<number>,
+    thermalLimitScale01: [1, 1, 1, 1] as MotorTuple<number>,
     batteryV: 0 as number,
     batteryI: 0 as number,
     throttle01: 0 as number,
+    manualThrottle01: 0 as number,
+    armLatchReady: false as boolean,
     targetWpIndex: 1 as number,
     rng: 123456789 as number,
     // Wind model state
     windPhase: null as number[] | null,
     windTime: 0 as number,
+    gpsTimer: 0 as number,
+    baroTimer: 0 as number,
+    rangefinderTimer: 0 as number,
+    magnetometerTimer: 0 as number,
+    imuTimer: 0 as number,
+    gpsSampleAgeSec: Number.POSITIVE_INFINITY,
+    baroSampleAgeSec: Number.POSITIVE_INFINITY,
+    rangefinderSampleAgeSec: Number.POSITIVE_INFINITY,
+    magnetometerSampleAgeSec: Number.POSITIVE_INFINITY,
+    gyroSampleAgeSec: Number.POSITIVE_INFINITY,
+    accelSampleAgeSec: Number.POSITIVE_INFINITY,
+    gpsAltitudeM: 0 as number,
+    gpsSpeedMS: 0 as number,
+    gpsSamplePosM: new THREE.Vector3(),
+    baroAltitudeM: 0 as number,
+    rangefinderM: 0 as number,
+    headingDeg: 0 as number,
+    gyroDps: 0 as number,
+    accelMS2: 0 as number,
+  });
+  const impactDebugRef = useRef({
+    pointMm: null as Point3 | null,
+    normalWorld: null as Point3 | null,
+    forceWorldN: null as Point3 | null,
+    forceN: 0,
+    ageSec: Number.POSITIVE_INFINITY,
+    contactCount: 0,
   });
 
   const prevViewModeRef = useRef(viewMode);
@@ -1165,31 +613,72 @@ export const DroneModel = memo(function DroneModel({
     flightState.current.motorOmegaRad = [0, 0, 0, 0];
     flightState.current.motorTiltRad = [0, 0, 0, 0];
     flightState.current.motorPhaseRad = [0, 0, 0, 0];
+    flightState.current.motorWash01 = [0, 0, 0, 0];
+    flightState.current.motorReload01 = [0, 0, 0, 0];
+    flightState.current.armDamage01 = [0, 0, 0, 0];
+    flightState.current.motorDamage01 = [0, 0, 0, 0];
+    flightState.current.batteryDamage01 = 0;
+    flightState.current.escCommand01 = [0, 0, 0, 0];
+    flightState.current.motorTempC = [
+      effectiveSimSettings.ambientTempC,
+      effectiveSimSettings.ambientTempC,
+      effectiveSimSettings.ambientTempC,
+      effectiveSimSettings.ambientTempC,
+    ];
+    flightState.current.motorCurrentA = [0, 0, 0, 0];
+    flightState.current.currentLimitScale01 = [1, 1, 1, 1];
+    flightState.current.thermalLimitScale01 = [1, 1, 1, 1];
     flightState.current.batteryV = propulsion.batteryCells * propulsion.vOpenPerCell;
     flightState.current.batteryI = 0;
     flightState.current.throttle01 = 0;
+    flightState.current.manualThrottle01 = 0;
+    flightState.current.armLatchReady = false;
     flightState.current.targetWpIndex = 1;
     flightState.current.rng = 123456789;
     flightState.current.windPhase = null;
     flightState.current.windTime = 0;
+    flightState.current.gpsTimer = 0;
+    flightState.current.baroTimer = 0;
+    flightState.current.rangefinderTimer = 0;
+    flightState.current.magnetometerTimer = 0;
+    flightState.current.imuTimer = 0;
+    flightState.current.gpsSampleAgeSec = Number.POSITIVE_INFINITY;
+    flightState.current.baroSampleAgeSec = Number.POSITIVE_INFINITY;
+    flightState.current.rangefinderSampleAgeSec = Number.POSITIVE_INFINITY;
+    flightState.current.magnetometerSampleAgeSec = Number.POSITIVE_INFINITY;
+    flightState.current.gyroSampleAgeSec = Number.POSITIVE_INFINITY;
+    flightState.current.accelSampleAgeSec = Number.POSITIVE_INFINITY;
+    flightState.current.gpsAltitudeM = 0;
+    flightState.current.gpsSpeedMS = 0;
+    flightState.current.gpsSamplePosM.set(0, 0, 0);
+    flightState.current.baroAltitudeM = 0;
+    flightState.current.rangefinderM = 0;
+    flightState.current.headingDeg = 0;
+    flightState.current.gyroDps = 0;
+    flightState.current.accelMS2 = 0;
+    impactDebugRef.current.pointMm = null;
+    impactDebugRef.current.normalWorld = null;
+    impactDebugRef.current.forceWorldN = null;
+    impactDebugRef.current.forceN = 0;
+    impactDebugRef.current.ageSec = Number.POSITIVE_INFINITY;
+    impactDebugRef.current.contactCount = 0;
 
     if (flightTelemetryRef) {
-      flightTelemetryRef.current = {
-        throttle01: 0,
-        thrustN: 0,
-        weightN: 0,
-        tw: 0,
-        altitudeM: 0,
-        speedMS: 0,
-        airspeedMS: 0,
-        windMS: 0,
-        groundEffectMult: 1,
-        batteryV: 0,
-        batteryI: 0,
-        armed: false,
-      };
+      flightTelemetryRef.current = createResetFlightTelemetry({
+        actuatorSpreadPct,
+        simSettings: effectiveSimSettings,
+        totalMassG: massProps.massKg * 1000,
+      });
     }
-  }, [flightTelemetryRef, propulsion.batteryCells, propulsion.vOpenPerCell]);
+  }, [
+    actuatorSpreadPct,
+    effectiveSimSettings.ambientTempC,
+    effectiveSimSettings,
+    flightTelemetryRef,
+    massProps.massKg,
+    propulsion.batteryCells,
+    propulsion.vOpenPerCell,
+  ]);
 
   React.useEffect(() => {
     const prev = prevViewModeRef.current;
@@ -1216,42 +705,207 @@ export const DroneModel = memo(function DroneModel({
     }
   }, [resetToken, resetFlightState, viewMode]);
 
+  const captureImpactFromCollision = React.useCallback((payload: unknown) => {
+    const collision = payload as CollisionPayloadLike | null;
+    const manifold = collision?.manifold;
+    const debug = impactDebugRef.current;
+    const contactPoint =
+      typeof manifold?.numSolverContacts === "function" &&
+      manifold.numSolverContacts() > 0 &&
+      typeof manifold.solverContactPoint === "function"
+      ? manifold.solverContactPoint(0)
+      : null;
+    const normal = typeof manifold?.normal === "function" ? manifold.normal() : null;
+
+    if (contactPoint) {
+      debug.pointMm = [contactPoint.x, contactPoint.y, contactPoint.z];
+    }
+    if (normal) {
+      const normalVector = new THREE.Vector3(normal.x, normal.y, normal.z);
+      if (collision?.flipped) normalVector.multiplyScalar(-1);
+      debug.normalWorld = [normalVector.x, normalVector.y, normalVector.z];
+    }
+    debug.ageSec = 0;
+    debug.contactCount = typeof manifold?.numSolverContacts === "function"
+      ? manifold.numSolverContacts()
+      : Math.max(1, debug.contactCount);
+  }, []);
+
+  const captureImpactForce = React.useCallback((payload: unknown) => {
+    const debug = impactDebugRef.current;
+    const state = flightState.current;
+    const contactForce = payload as ContactForcePayloadLike | null;
+    const totalForce = contactForce?.totalForce;
+    const forceVector = totalForce && typeof totalForce.x === "number"
+      ? new THREE.Vector3(totalForce.x, totalForce.y, totalForce.z)
+      : null;
+    const maxForceDirection = contactForce?.maxForceDirection;
+    const directionVector = maxForceDirection && typeof maxForceDirection.x === "number"
+      ? new THREE.Vector3(maxForceDirection.x, maxForceDirection.y, maxForceDirection.z)
+      : null;
+    const magnitudeFromPayload = typeof contactForce?.totalForceMagnitude === "number"
+      ? contactForce.totalForceMagnitude
+      : typeof contactForce?.maxForceMagnitude === "number"
+        ? contactForce.maxForceMagnitude
+        : 0;
+
+    if (forceVector) {
+      debug.forceWorldN = [forceVector.x, forceVector.y, forceVector.z];
+      debug.forceN = forceVector.length();
+    } else if (directionVector && magnitudeFromPayload > 0) {
+      directionVector.normalize().multiplyScalar(magnitudeFromPayload);
+      debug.forceWorldN = [directionVector.x, directionVector.y, directionVector.z];
+      debug.forceN = magnitudeFromPayload;
+    } else {
+      debug.forceWorldN = null;
+      debug.forceN = magnitudeFromPayload;
+    }
+
+    if (!debug.normalWorld && directionVector) {
+      const normalizedDirection = directionVector.clone().normalize();
+      debug.normalWorld = [normalizedDirection.x, normalizedDirection.y, normalizedDirection.z];
+    }
+
+    if (!debug.pointMm) {
+      const translation = flightBodyRef.current?.translation?.();
+      if (translation) {
+        debug.pointMm = [
+          translation.x,
+          translation.y - assemblyHalfExtents[1],
+          translation.z,
+        ];
+      }
+    }
+
+    debug.ageSec = 0;
+    debug.contactCount = Math.max(1, debug.contactCount);
+
+    if (debug.forceN <= 0) return;
+    if (!state.armed) return;
+
+    const linearSpeedMS = state.velM.length();
+    const angularSpeedRadS = state.omegaBody.length();
+    const contactNormal = debug.normalWorld
+      ? new THREE.Vector3(
+          debug.normalWorld[0],
+          debug.normalWorld[1],
+          debug.normalWorld[2],
+        ).normalize()
+      : null;
+    const isSupportContact = !!contactNormal && contactNormal.y > 0.72;
+    const impactMotionSignal = Math.max(
+      linearSpeedMS,
+      angularSpeedRadS * Math.max(0.08, params.frameSize * 0.0005),
+    );
+
+    if (isSupportContact && impactMotionSignal < 0.85) {
+      return;
+    }
+
+    const contactPointMm = debug.pointMm
+      ? new THREE.Vector3(debug.pointMm[0], debug.pointMm[1], debug.pointMm[2])
+      : new THREE.Vector3(0, 0, 0);
+    const localPointMm = contactPointMm
+      .clone()
+      .multiplyScalar(1e-3)
+      .sub(state.posM)
+      .applyQuaternion(state.quat.clone().invert())
+      .multiplyScalar(1000);
+    const localMotors = buildMotorTuple(
+      (index) => new THREE.Vector3(...motorPositions[index]),
+    );
+    let nearestMotorIndex = 0;
+    let nearestMotorDistance = Number.POSITIVE_INFINITY;
+    for (const i of motorIndices) {
+      const distance = localMotors[i].distanceTo(localPointMm);
+      if (distance < nearestMotorDistance) {
+        nearestMotorDistance = distance;
+        nearestMotorIndex = i;
+      }
+    }
+
+    const batteryLocalMm = new THREE.Vector3(
+      0,
+      plateThickness + standoffHeight + topPlateThickness + 15,
+      0,
+    );
+    const batteryDistance = batteryLocalMm.distanceTo(localPointMm);
+    const fragility = Math.max(0.2, effectiveSimSettings.impactFragilityScale);
+    const armImpact = Math.max(0, debug.forceN / Math.max(1, effectiveSimSettings.armFractureForceN) - 0.35);
+    const motorImpact = Math.max(0, debug.forceN / Math.max(1, effectiveSimSettings.motorDamageForceN) - 0.25);
+    const batteryImpact = Math.max(0, debug.forceN / Math.max(1, effectiveSimSettings.batteryDamageForceN) - 0.35);
+    const nearMotorWeight = THREE.MathUtils.clamp(1 - nearestMotorDistance / 80, 0.15, 1);
+    const batteryWeight = THREE.MathUtils.clamp(1 - batteryDistance / 90, 0.2, 1);
+
+    state.armDamage01[nearestMotorIndex] = THREE.MathUtils.clamp(
+      (state.armDamage01[nearestMotorIndex] ?? 0) + Math.pow(armImpact, 1.15) * 0.18 * fragility * nearMotorWeight,
+      0,
+      1,
+    );
+    state.motorDamage01[nearestMotorIndex] = THREE.MathUtils.clamp(
+      (state.motorDamage01[nearestMotorIndex] ?? 0) + Math.pow(motorImpact, 1.12) * 0.16 * fragility * nearMotorWeight,
+      0,
+      1,
+    );
+    state.batteryDamage01 = THREE.MathUtils.clamp(
+      state.batteryDamage01 + Math.pow(batteryImpact, 1.08) * 0.12 * fragility * batteryWeight,
+      0,
+      1,
+    );
+  }, [
+    assemblyHalfExtents,
+    effectiveSimSettings.armFractureForceN,
+    effectiveSimSettings.batteryDamageForceN,
+    effectiveSimSettings.impactFragilityScale,
+    effectiveSimSettings.motorDamageForceN,
+    motorPositions,
+    plateThickness,
+    standoffHeight,
+    topPlateThickness,
+  ]);
+
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      const code = e.code;
+      if (viewMode !== "flight_sim") return;
 
-      const isSpace = code === "Space" || key === " " || key === "space" || key === "spacebar";
-      const isShift = code === "ShiftLeft" || code === "ShiftRight" || key === "shift";
+      const mappedKey = mapFlightKey(e);
+      if (!mappedKey) return;
 
-      if (isSpace) keys.current.space = true;
-      else if (isShift) keys.current.shift = true;
-      else if (keys.current.hasOwnProperty(key)) (keys.current as any)[key] = true;
+      e.preventDefault();
+      blurActiveFlightControl();
+      setKeyState(mappedKey, true);
     };
+
     const handleKeyUp = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      const code = e.code;
+      if (viewMode !== "flight_sim") return;
 
-      const isSpace = code === "Space" || key === " " || key === "space" || key === "spacebar";
-      const isShift = code === "ShiftLeft" || code === "ShiftRight" || key === "shift";
+      const mappedKey = mapFlightKey(e);
+      if (!mappedKey) return;
 
-      if (isSpace) keys.current.space = false;
-      else if (isShift) keys.current.shift = false;
-      else if (keys.current.hasOwnProperty(key)) (keys.current as any)[key] = false;
+      e.preventDefault();
+      setKeyState(mappedKey, false);
     };
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
+
+    const handleWindowBlur = () => {
+      resetKeyState();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("blur", handleWindowBlur);
+
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("blur", handleWindowBlur);
+      resetKeyState();
     };
-  }, []);
+  }, [viewMode]);
 
   const flightTelemetryTickRef = useRef({ t: 0 });
 
-  useFrame((state, delta) => {
+  useFrame((_state, delta) => {
     if (!groupRef.current) return;
-    const drone = groupRef.current;
 
     if (viewMode === "flight_sim") {
       const dt = Math.min(delta, 1 / 30);
@@ -1275,8 +929,20 @@ export const DroneModel = memo(function DroneModel({
           body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
           s.armed = false;
           flightInitDone.current = true;
-        } catch {
-          // If Rapier is in a bad state (e.g. after a hot reload), avoid crashing the render loop.
+          if (physicsRuntimeIssueRef.current) {
+            physicsRuntimeIssueRef.current = false;
+            onRuntimeIssue?.("physics", null);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!physicsRuntimeIssueRef.current) {
+            console.error("Flight physics failed to initialize.", error);
+          }
+          physicsRuntimeIssueRef.current = true;
+          onRuntimeIssue?.(
+            "physics",
+            `Flight physics failed to initialize. Reset the sim or reload the view. ${message}`,
+          );
           flightInitDone.current = false;
           return;
         }
@@ -1298,10 +964,19 @@ export const DroneModel = memo(function DroneModel({
         s.omegaBody.copy(omegaWorld.applyQuaternion(invQuat));
       }
 
-      const rho = propulsion.airDensityKgM3;
       const D = propulsion.diameterM;
       const Ct0 = propulsion.Ct0;
       const Cq0 = propulsion.Cq0;
+
+      const colliderLocalY = assemblyColliderCenterY - massProps.comMm.y; // mm
+      const bottomAGLM =
+        s.posM.y + (colliderLocalY - assemblyHalfExtents[1]) * 1e-3;
+      const atmosphere = evaluateAtmosphere(
+        bottomAGLM,
+        effectiveSimSettings.ambientTempC,
+        effectiveSimSettings.humidityPct,
+      );
+      const rho = atmosphere.densityKgM3;
 
       const Vopen = propulsion.batteryCells * propulsion.vOpenPerCell;
       if (!s.batteryV || !Number.isFinite(s.batteryV)) s.batteryV = Vopen;
@@ -1319,7 +994,7 @@ export const DroneModel = memo(function DroneModel({
       const expectedHoverPerMotorN = (massKg * g) / 4;
       const up = new THREE.Vector3(0, 1, 0);
       let verticalEff = 0;
-      for (let i = 0; i < 4; i++) {
+      for (const i of motorIndices) {
         // Static motor tilt/misalignment
         const deg = propulsion.staticMisalignDeg;
         const tiltX = THREE.MathUtils.degToRad(((i < 2 ? -1 : 1) * deg) * 0.35);
@@ -1329,10 +1004,11 @@ export const DroneModel = memo(function DroneModel({
         );
 
         // Flex tilt around axis derived from arm direction
+        const motorPosition = motorPositions[i];
         const r = new THREE.Vector3(
-          (motorPositions[i][0] - comMm.x) * mmToM,
+          (motorPosition[0] - comMm.x) * mmToM,
           0,
-          (motorPositions[i][2] - comMm.z) * mmToM,
+          (motorPosition[2] - comMm.z) * mmToM,
         );
         if (r.lengthSq() < 1e-9) r.set(1, 0, 0);
         r.normalize();
@@ -1349,17 +1025,26 @@ export const DroneModel = memo(function DroneModel({
 
       // Reaction yaw torque per thrust: Q/T = (Cq/Ct)*D
       const yawCoeffNmPerN = (Cq0 / Math.max(1e-6, Ct0)) * D;
-      const yawSign = [1, -1, 1, -1];
+      const yawSign: MotorTuple<number> = [1, -1, 1, -1];
 
       // --- Control inputs (manual or waypoint autopilot) ---
       let throttleCmd01: number;
       let desiredRateBody = new THREE.Vector3(0, 0, 0); // x=pitch, y=yaw, z=roll
-
-      const hoverThrottle01 = Math.sqrt(
-        Math.min(
-          1,
-          (massKg * g) / Math.max(1e-6, totalMaxThrustN * verticalEff),
-        ),
+      const acroRateDegPerSec = THREE.MathUtils.clamp(
+        effectiveSimSettings.acroRateDegPerSec,
+        360,
+        1400,
+      );
+      const acroExpo = THREE.MathUtils.clamp(effectiveSimSettings.acroExpo, 0, 0.75);
+      const airmodeStrength = THREE.MathUtils.clamp(
+        effectiveSimSettings.airmodeStrength,
+        0,
+        1,
+      );
+      const propWashCoupling = THREE.MathUtils.clamp(
+        effectiveSimSettings.propWashCoupling,
+        0,
+        1,
       );
 
       if (isFlyingPath && waypoints.length >= 2) {
@@ -1370,6 +1055,9 @@ export const DroneModel = memo(function DroneModel({
           waypoints.length - 1,
         );
         const wp = waypoints[idx];
+        if (!wp) {
+          return;
+        }
         const targetM = new THREE.Vector3(
           wp.x / 1000,
           Math.max((wp.y + 20) / 1000, 0.02),
@@ -1484,29 +1172,23 @@ export const DroneModel = memo(function DroneModel({
             gpRoll = clamp11(rsx);
             gpPitch = clamp11(-rsy);
           }
-        } catch {
-          // ignore
+          if (controllerRuntimeIssueRef.current) {
+            controllerRuntimeIssueRef.current = false;
+            onRuntimeIssue?.("controller", null);
+          }
+        } catch (error) {
+          if (!controllerRuntimeIssueRef.current) {
+            console.warn("Gamepad polling failed; falling back to keyboard-only controls.", error);
+          }
+          controllerRuntimeIssueRef.current = true;
+          onRuntimeIssue?.(
+            "controller",
+            "Gamepad polling failed, so controller input is unavailable until the browser recovers.",
+          );
         }
 
         const kbThrottleDelta = (keys.current.space ? 1 : 0) - (keys.current.shift ? 1 : 0);
-        const throttleInput = clamp11(kbThrottleDelta + gpThrottle);
-
-        // Start on the ground with motors off until the user commands throttle-up.
-        // (Realistic "arming" concept still exists, but it's automatic so you don't think about it.)
-        if (!s.armed) {
-          if (throttleInput > 0.05) s.armed = true;
-          throttleCmd01 = 0;
-          desiredRateBody.set(0, 0, 0);
-        } else {
-          // Neutral throttle aims for hover, but small modeling biases can create a slow climb/sink.
-          // Add a light vertical-velocity damper when the user is not actively commanding throttle.
-          const kVzDamp = 0.045; // throttle fraction per (m/s) vertical speed
-          const vzDamp = Math.abs(throttleInput) < 1e-3
-            ? THREE.MathUtils.clamp(-s.velM.y * kVzDamp, -0.08, 0.08)
-            : 0;
-          const targetThrottle = hoverThrottle01 + throttleInput * (0.18 * sens) + vzDamp;
-          throttleCmd01 = clamp01(targetThrottle);
-
+        const hasGamepadThrottle = Math.abs(gpThrottle) > 1e-3;
         const pitchCmd =
           clamp11(((keys.current.w ? 1 : 0) - (keys.current.s ? 1 : 0)) + gpPitch);
         const rollCmd =
@@ -1514,53 +1196,85 @@ export const DroneModel = memo(function DroneModel({
         const yawCmd =
           clamp11(((keys.current.q ? 1 : 0) - (keys.current.e ? 1 : 0)) + gpYaw);
 
-        const maxPitchRate = 2.2 * sens;
-        const maxRollRate = 2.6 * sens;
-        const maxYawRate = 2.2 * sens;
+        const rateProfile = THREE.MathUtils.clamp((sens - 0.2) / 0.8, 0, 1);
+        const shapeRateInput = (input: number, expo: number) => {
+          const clamped = clamp11(input);
+          return clamped * (1 - expo) + clamped * clamped * clamped * expo;
+        };
 
-        // Self-level: angle-mode attitude hold (like Betaflight angle mode)
-        // Computes tilt error between body-up and world-up, and additionally
-        // leans into horizontal velocity to provide velocity damping.
-        const bodyUp = new THREE.Vector3(0, 1, 0).applyQuaternion(s.quat);
-        const worldUp = new THREE.Vector3(0, 1, 0);
-
-        // Tilt axis (world) = bodyUp × worldUp, angle = acos(dot)
-        const tiltCross = bodyUp.clone().cross(worldUp);
-        const tiltDot = THREE.MathUtils.clamp(bodyUp.dot(worldUp), -1, 1);
-        const tiltAngle = Math.acos(tiltDot); // 0 = level
-
-        // Convert tilt correction axis to body frame
-        const kpLevel = 8.0; // proportional self-level gain (rad/s per rad error)
-        const kdLevel = 2.0; // derivative damping on angular rate
-        let levelRateBody = new THREE.Vector3(0, 0, 0);
-        if (tiltAngle > 0.002) {
-          const corrAxis = tiltCross.normalize().multiplyScalar(tiltAngle * kpLevel);
-          levelRateBody = corrAxis.applyQuaternion(s.quat.clone().invert());
-        }
-        // Derivative damping: oppose current angular rate for stability
-        levelRateBody.add(s.omegaBody.clone().multiplyScalar(-kdLevel));
-
-        // Velocity damping: lean into horizontal velocity to oppose drift
-        // This simulates GPS-assisted position hold behavior
-        const vHoriz = new THREE.Vector3(s.velM.x, 0, s.velM.z);
-        const hSpeed = vHoriz.length();
-        if (hSpeed > 0.02) {
-          const kVelDamp = 1.5; // rad/s per m/s of horizontal speed
-          const maxLean = 0.8; // max lean rate contribution
-          const dampRate = Math.min(maxLean, hSpeed * kVelDamp);
-          // To oppose velocity V, we tilt the drone so thrust has a -V component.
-          // Tilt axis in world = up × normalize(V), and we rotate by a positive angle.
-          const vDir = vHoriz.clone().normalize();
-          const tiltAxis = vDir.clone().cross(worldUp).normalize().multiplyScalar(dampRate);
-          const dampRateBody = tiltAxis.applyQuaternion(s.quat.clone().invert());
-          levelRateBody.add(dampRateBody);
+        let throttleStick01 = 0;
+        if (hasGamepadThrottle) {
+          throttleStick01 = clamp01(Math.max(0, gpThrottle));
+          s.manualThrottle01 = throttleStick01;
+        } else {
+          const keyboardThrottleTarget01 =
+            kbThrottleDelta > 0 ? 1 : kbThrottleDelta < 0 ? 0 : 0;
+          const keyboardTauSec = kbThrottleDelta === 0 ? 0.08 : 0.05;
+          const keyboardBlend = 1 - Math.exp(-dt / keyboardTauSec);
+          s.manualThrottle01 = THREE.MathUtils.lerp(
+            s.manualThrottle01 ?? 0,
+            keyboardThrottleTarget01,
+            keyboardBlend,
+          );
+          throttleStick01 = s.manualThrottle01;
         }
 
-          // Blend: stick input overrides self-level on the corresponding axis
+        if (throttleStick01 < 0.02) {
+          s.armLatchReady = true;
+        }
+
+        // Start on the ground with motors off until the user commands throttle-up.
+        if (!s.armed) {
+          if (s.armLatchReady && throttleStick01 > 0.05) s.armed = true;
+          throttleCmd01 = 0;
+          desiredRateBody.set(0, 0, 0);
+        } else {
+          throttleCmd01 = shapeThrottleCurve(
+            throttleStick01,
+            effectiveSimSettings.throttleMid01,
+            effectiveSimSettings.throttleExpo,
+          );
+
+          let pitchRateDeg = 0;
+          let yawRateDeg = 0;
+          let rollRateDeg = 0;
+
+          if (effectiveSimSettings.rateProfileMode === "betaflight") {
+            pitchRateDeg = mapBetaflightRateDegPerSec(
+              pitchCmd,
+              effectiveSimSettings.betaflightRcRate,
+              effectiveSimSettings.betaflightSuperRate,
+              effectiveSimSettings.betaflightExpo,
+            );
+            rollRateDeg = mapBetaflightRateDegPerSec(
+              rollCmd,
+              effectiveSimSettings.betaflightRcRate,
+              effectiveSimSettings.betaflightSuperRate,
+              effectiveSimSettings.betaflightExpo,
+            );
+            yawRateDeg = mapBetaflightRateDegPerSec(
+              yawCmd,
+              effectiveSimSettings.betaflightYawRcRate,
+              effectiveSimSettings.betaflightYawSuperRate,
+              effectiveSimSettings.betaflightYawExpo,
+            );
+          } else {
+            const pitchExpo = THREE.MathUtils.clamp(acroExpo + 0.02, 0, 0.8);
+            const rollExpo = THREE.MathUtils.clamp(acroExpo + 0.02, 0, 0.8);
+            const yawExpo = THREE.MathUtils.clamp(acroExpo * 0.55, 0, 0.6);
+            const maxPitchRate = acroRateDegPerSec * THREE.MathUtils.lerp(0.92, 1.08, rateProfile);
+            const maxRollRate = acroRateDegPerSec * THREE.MathUtils.lerp(0.96, 1.12, rateProfile);
+            const maxYawRate = acroRateDegPerSec * THREE.MathUtils.lerp(0.56, 0.72, rateProfile);
+
+            pitchRateDeg = shapeRateInput(pitchCmd, pitchExpo) * maxPitchRate;
+            yawRateDeg = shapeRateInput(yawCmd, yawExpo) * maxYawRate;
+            rollRateDeg = shapeRateInput(rollCmd, rollExpo) * maxRollRate;
+          }
+
           desiredRateBody.set(
-            pitchCmd !== 0 ? pitchCmd * maxPitchRate : levelRateBody.x,
-            yawCmd * maxYawRate,
-            rollCmd !== 0 ? rollCmd * maxRollRate : levelRateBody.z,
+            THREE.MathUtils.degToRad(pitchRateDeg),
+            THREE.MathUtils.degToRad(yawRateDeg),
+            THREE.MathUtils.degToRad(rollRateDeg),
           );
         }
       }
@@ -1571,8 +1285,9 @@ export const DroneModel = memo(function DroneModel({
           // Motors off on the ground until armed.
           s.throttle01 = 0;
           s.motorOmegaRad = [0, 0, 0, 0];
+          s.escCommand01 = [0, 0, 0, 0];
         } else {
-          const tau = 0.12;
+          const tau = isFlyingPath ? 0.07 : 0.035;
           const a = 1 - Math.exp(-dt / tau);
           s.throttle01 = THREE.MathUtils.lerp(s.throttle01, throttleCmd01, a);
         }
@@ -1582,7 +1297,8 @@ export const DroneModel = memo(function DroneModel({
       const tolMm = 0.05;
       // comMm already defined above
 
-      const rBody = motorPositions.map((p, i) => {
+      const rBody = buildMotorTuple((i) => {
+        const p = motorPositions[i];
         const tx = (i % 2 === 0 ? -1 : 1) * tolMm;
         const tz = (i < 2 ? -1 : 1) * tolMm;
         return new THREE.Vector3(
@@ -1603,15 +1319,16 @@ export const DroneModel = memo(function DroneModel({
         return ((u - 2) / 0.577350269) * std;
       };
 
+      const sensorNoiseScale = Math.max(0, effectiveSimSettings.sensorNoiseScale);
       const omegaMeas = s.omegaBody.clone();
-      omegaMeas.x += randN(propulsion.imuRateNoiseStdRad);
-      omegaMeas.y += randN(propulsion.imuRateNoiseStdRad);
-      omegaMeas.z += randN(propulsion.imuRateNoiseStdRad);
+      omegaMeas.x += randN(propulsion.imuRateNoiseStdRad * sensorNoiseScale);
+      omegaMeas.y += randN(propulsion.imuRateNoiseStdRad * sensorNoiseScale);
+      omegaMeas.z += randN(propulsion.imuRateNoiseStdRad * sensorNoiseScale);
 
       // Motor-frequency vibration injected into IMU rates (uses last-step motor omega/phase)
       {
         const up = new THREE.Vector3(0, 1, 0);
-        for (let i = 0; i < 4; i++) {
+        for (const i of motorIndices) {
           const omega = Math.max(0, s.motorOmegaRad[i] ?? 0);
           const vib = Math.sin((s.motorPhaseRad[i] ?? 0) * 3);
           const vibAmp = propulsion.vibRateAmpRad * (omegaMaxRad > 1e-6 ? omega / omegaMaxRad : 0);
@@ -1626,7 +1343,8 @@ export const DroneModel = memo(function DroneModel({
       }
 
       // --- Rate controller (body) using full inertia tensor ---
-      const kpRate = 6.0;
+      const manualMode = !isFlyingPath;
+      const kpRate = isFlyingPath ? 6.0 : 6.9;
       const rateErr = desiredRateBody.clone().sub(omegaMeas);
       const alphaCmd = rateErr.multiplyScalar(kpRate);
 
@@ -1635,7 +1353,15 @@ export const DroneModel = memo(function DroneModel({
       const torqueCmdBodyNm = mulMat3Vec(massProps.inertiaKgM2, alphaCmd).add(gyro);
 
       // Desired total thrust (N)
-      const thrustCmdN = clamp01(s.throttle01) ** 2 * totalMaxThrustN;
+      const idleThrottle01 = s.armed && manualMode ? 0.038 : 0;
+      const effectiveThrottle01 = clamp01(idleThrottle01 + (1 - idleThrottle01) * clamp01(s.throttle01));
+      const lowThrottleBlend = manualMode
+        ? THREE.MathUtils.clamp(1 - effectiveThrottle01 / 0.38, 0, 1)
+        : 0;
+      const thrustCmdN = Math.min(
+        totalMaxThrustN,
+        effectiveThrottle01 ** 2 * totalMaxThrustN,
+      );
 
       // Mixer: solve linear system for per-motor thrusts.
       // Σf = T
@@ -1656,22 +1382,123 @@ export const DroneModel = memo(function DroneModel({
       const b = [thrustCmdN, torqueCmdBodyNm.x, torqueCmdBodyNm.z, torqueCmdBodyNm.y];
 
       const mix = solve4x4(A, b);
-      const fTargetN = mix ?? [thrustCmdN / 4, thrustCmdN / 4, thrustCmdN / 4, thrustCmdN / 4];
+      const fTargetN: MotorTuple<number> =
+        mix ?? [thrustCmdN / 4, thrustCmdN / 4, thrustCmdN / 4, thrustCmdN / 4];
 
-      for (let i = 0; i < 4; i++) {
+      for (const i of motorIndices) {
         fTargetN[i] = Math.max(0, Math.min(thrustMaxPerMotorN, fTargetN[i]));
       }
 
+      const fracturedArmCount = s.armDamage01.reduce(
+        (count, damage) => count + (damage >= 0.98 ? 1 : 0),
+        0,
+      );
+      const meanArmDamage01 = s.armDamage01.reduce((sum, damage) => sum + damage, 0) / 4;
+      const meanMotorDamage01 = s.motorDamage01.reduce((sum, damage) => sum + damage, 0) / 4;
+      const structureDamage01 = THREE.MathUtils.clamp(
+        meanArmDamage01 * 0.82 + fracturedArmCount * 0.09,
+        0,
+        1,
+      );
+      const effectiveMotorHealthScales = motorHealthScales.map((baseScale, i) => {
+        const armDamage01 = THREE.MathUtils.clamp(s.armDamage01[i] ?? 0, 0, 1);
+        const motorDamage01 = THREE.MathUtils.clamp(s.motorDamage01[i] ?? 0, 0, 1);
+        const fractured = armDamage01 >= 0.98;
+        const damageScale = THREE.MathUtils.clamp(
+          1 - armDamage01 * 0.4 - motorDamage01 * 0.72,
+          fractured ? 0.04 : 0.18,
+          1,
+        );
+        return baseScale * damageScale;
+      });
+
       // Convert thrust targets to omega targets (assume Ct0 for command inversion)
-      const motorA = 1 - Math.exp(-dt / propulsion.motorTauSec);
-      for (let i = 0; i < 4; i++) {
-        const f = fTargetN[i];
-        const omegaTarget =
-          f > 0
-            ? 2 * Math.PI * Math.sqrt(f / Math.max(1e-9, Ct0 * rho * Math.pow(D, 4)))
+      const currentLimitPerMotorA = Math.max(5, effectiveSimSettings.motorCurrentLimitA / 4);
+      const kTorqueNmPerA = 60 / (2 * Math.PI * Math.max(1, propulsion.motorKV));
+      for (const i of motorIndices) {
+        const healthScale = effectiveMotorHealthScales[i] ?? 1;
+        const armDamage01 = THREE.MathUtils.clamp(s.armDamage01[i] ?? 0, 0, 1);
+        const motorDamage01 = THREE.MathUtils.clamp(s.motorDamage01[i] ?? 0, 0, 1);
+        const thrustCapN = thrustMaxPerMotorN * healthScale;
+        const motorTempC = s.motorTempC[i] ?? effectiveSimSettings.ambientTempC;
+        const thermalLimitScale = motorTempC <= propulsion.thermalSoftLimitC
+          ? 1
+          : motorTempC >= propulsion.thermalHardLimitC
+            ? 0.32
+            : THREE.MathUtils.lerp(
+              1,
+              0.32,
+              (motorTempC - propulsion.thermalSoftLimitC) /
+                Math.max(1e-6, propulsion.thermalHardLimitC - propulsion.thermalSoftLimitC),
+            );
+        const estimatedOmegaTarget =
+          thrustCapN > 1e-9 && fTargetN[i] > 0
+            ? 2 * Math.PI * Math.sqrt(
+              Math.max(0, Math.min(thrustCapN, fTargetN[i])) /
+                Math.max(1e-9, Ct0 * healthScale * rho * Math.pow(D, 4)),
+            )
             : 0;
-        const omegaClamped = Math.max(0, Math.min(omegaTarget, omegaMaxRad));
-        s.motorOmegaRad[i] = THREE.MathUtils.lerp(s.motorOmegaRad[i] ?? 0, omegaClamped, motorA);
+        const nTarget = estimatedOmegaTarget / (2 * Math.PI);
+        const estimatedTorqueNm = Cq0 * healthScale * rho * nTarget * nTarget * Math.pow(D, 5);
+        const estimatedElectricalPowerW = estimatedTorqueNm * estimatedOmegaTarget / Math.max(0.2, propulsion.motorEff);
+        const estimatedCurrentA = estimatedElectricalPowerW / Math.max(1, Vpack);
+        const currentLimitScale = estimatedCurrentA > 1e-6
+          ? Math.min(1, currentLimitPerMotorA / estimatedCurrentA)
+          : 1;
+        const availableScale = Math.min(currentLimitScale, thermalLimitScale);
+        const availableThrustCapN = thrustCapN * availableScale;
+        const f = Math.min(availableThrustCapN, Math.max(0, fTargetN[i]));
+        s.currentLimitScale01[i] = currentLimitScale;
+        s.thermalLimitScale01[i] = thermalLimitScale;
+        const escA = 1 - Math.exp(-dt / Math.max(0.003, effectiveSimSettings.escLatencyMs * 1e-3 + 0.004));
+        s.escCommand01[i] = THREE.MathUtils.lerp(
+          s.escCommand01[i] ?? 0,
+          availableThrustCapN > 1e-6 ? f / availableThrustCapN : 0,
+          escA,
+        );
+        const omegaTarget =
+          s.escCommand01[i] > 0
+            ? 2 * Math.PI * Math.sqrt(
+              (s.escCommand01[i] * availableThrustCapN) /
+                Math.max(1e-9, Ct0 * healthScale * rho * Math.pow(D, 4)),
+            )
+            : 0;
+        const omegaClamped = Math.max(
+          0,
+          Math.min(omegaTarget, omegaMaxRad * Math.sqrt(healthScale)),
+        );
+        const omegaCurrent = Math.max(0, s.motorOmegaRad[i] ?? 0);
+        const maxOmegaForMotor = Math.max(1, omegaMaxRad * Math.sqrt(healthScale));
+        const voltageScale = THREE.MathUtils.clamp(Vpack / Math.max(1, Vopen), 0.72, 1.02);
+        const trackingError01 = THREE.MathUtils.clamp(
+          (omegaClamped - omegaCurrent) / Math.max(120, maxOmegaForMotor * 0.35),
+          -1,
+          1,
+        );
+        const currentDemandA = currentLimitPerMotorA * s.escCommand01[i] * (0.35 + 0.65 * Math.max(0, trackingError01));
+        const backEmf01 = THREE.MathUtils.clamp(omegaCurrent / maxOmegaForMotor, 0, 1.15);
+        const driveTorqueNm =
+          kTorqueNmPerA * currentDemandA * voltageScale * Math.max(0.06, 1 - backEmf01 * 0.82);
+        const omegaCurrentHz = omegaCurrent / (2 * Math.PI);
+        const aeroLoadTorqueNm =
+          Cq0 * healthScale * rho * omegaCurrentHz * omegaCurrentHz * Math.pow(D, 5);
+        const trackingTauSec = Math.max(
+          0.008,
+          propulsion.motorTauSec *
+            (manualMode ? 1.45 : 1) *
+            (0.58 + propulsion.rotorInertiaScale * 0.42) *
+            (1 + armDamage01 * 0.45 + motorDamage01 * 0.8),
+        );
+        const assistTorqueNm = THREE.MathUtils.clamp(
+          propulsion.rotorInertiaKgM2 * (omegaClamped - omegaCurrent) / trackingTauSec,
+          -driveTorqueNm * (manualMode ? 0.4 : 0.65),
+          driveTorqueNm * (manualMode ? 0.7 : 1),
+        );
+        const angularAccelRadS2 =
+          (driveTorqueNm + assistTorqueNm - aeroLoadTorqueNm) /
+          Math.max(1e-9, propulsion.rotorInertiaKgM2);
+        const omegaNext = omegaCurrent + angularAccelRadS2 * dt;
+        s.motorOmegaRad[i] = THREE.MathUtils.clamp(omegaNext, 0, maxOmegaForMotor);
       }
 
       // Aerodynamics: thrust/torque from omega and advance ratio, plus frame flex + static motor misalignment.
@@ -1680,22 +1507,35 @@ export const DroneModel = memo(function DroneModel({
       const Fbody = new THREE.Vector3(0, 0, 0);
       const torqueBodyNm = new THREE.Vector3(0, 0, 0);
       let mechPowerW = 0;
+      const motorElectricalPowerW: MotorTuple<number> = [0, 0, 0, 0];
+      let propWashLossAccum = 0;
+      let rotorReloadLossAccum = 0;
 
       const tmpAxis = new THREE.Vector3();
       const tmpF = new THREE.Vector3();
       const tmpTau = new THREE.Vector3();
+      const discAreaM2 = Math.PI * Math.pow(D * 0.5, 2);
+      const bodyRateDeg = THREE.MathUtils.radToDeg(s.omegaBody.length());
+      const rateAggression01 = THREE.MathUtils.clamp((bodyRateDeg - 180) / 900, 0, 1);
 
       const aFlex = 1 - Math.exp(-dt / propulsion.flexTauSec);
-      for (let i = 0; i < 4; i++) {
+      for (const i of motorIndices) {
         const omega = Math.max(0, s.motorOmegaRad[i] ?? 0);
         const n = omega / (2 * Math.PI);
+        const armDamage01 = THREE.MathUtils.clamp(s.armDamage01[i] ?? 0, 0, 1);
+        const motorDamage01 = THREE.MathUtils.clamp(s.motorDamage01[i] ?? 0, 0, 1);
+        const fractured = armDamage01 >= 0.98;
 
         // Flex target derived from commanded thrust (keeps it causal but stable)
-        const flexTarget = fTargetN[i] * propulsion.flexRadPerN;
+        const flexTarget = fTargetN[i] * propulsion.flexRadPerN * (1 + armDamage01 * 1.1);
         s.motorTiltRad[i] = THREE.MathUtils.lerp(s.motorTiltRad[i] ?? 0, flexTarget, aFlex);
 
         // Static motor tilt/misalignment (print/assembly realism)
-        const deg = propulsion.staticMisalignDeg;
+        const deg =
+          propulsion.staticMisalignDeg +
+          armDamage01 * 6.5 +
+          motorDamage01 * 4.5 +
+          (fractured ? 9 : 0);
         const tiltX = THREE.MathUtils.degToRad(((i < 2 ? -1 : 1) * deg) * 0.35);
         const tiltZ = THREE.MathUtils.degToRad(((i % 2 === 0 ? -1 : 1) * deg) * 0.45);
         const staticQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(tiltX, 0, tiltZ));
@@ -1717,12 +1557,72 @@ export const DroneModel = memo(function DroneModel({
         // Advance ratio along the actual thrust axis
         const vIn = Math.max(0, -vBody.dot(tmpAxis));
         const J = n > 1e-6 && D > 1e-6 ? vIn / (n * D) : 0;
-        const Ct = Ct0 * THREE.MathUtils.clamp(1 - 0.6 * J, 0, 1.25);
-        const Cq = Cq0 * THREE.MathUtils.clamp(1 - 0.5 * J, 0, 1.25);
+        const healthScale = effectiveMotorHealthScales[i] ?? 1;
+        const thrustCoeff = Math.max(1e-9, Ct0 * healthScale * rho * Math.pow(D, 4));
+        const omegaTargetFromThrust = fTargetN[i] > 1e-6
+          ? 2 * Math.PI * Math.sqrt(fTargetN[i] / thrustCoeff)
+          : 0;
+        const inducedVelocityMS = Math.sqrt(
+          Math.max(0, fTargetN[i]) / Math.max(1e-6, 2 * rho * discAreaM2),
+        );
+        const sinkIntoWashMS = Math.max(0, vIn - inducedVelocityMS * 0.55);
+        const washTarget01 = THREE.MathUtils.clamp(
+          (sinkIntoWashMS / Math.max(1.2, inducedVelocityMS * 1.75)) *
+            (manualMode ? 0.74 : 0.6 + 0.4 * rateAggression01) *
+            propWashCoupling *
+            (manualMode ? 1.18 : 1),
+          0,
+          1,
+        );
+        const omegaError01 = THREE.MathUtils.clamp(
+          Math.max(0, omegaTargetFromThrust - omega) / Math.max(120, omegaMaxRad * 0.35),
+          0,
+          1,
+        );
+        const reloadTarget01 = THREE.MathUtils.clamp(
+          propWashCoupling * (
+            washTarget01 * (manualMode ? 0.88 : 0.7) +
+            rateAggression01 * lowThrottleBlend * (manualMode ? 0.6 : 0.45) +
+            omegaError01 * (manualMode ? 0.82 : 0.65)
+          ) * (manualMode ? 1.12 : 1),
+          0,
+          1,
+        );
+        const washTauSec = washTarget01 > (s.motorWash01[i] ?? 0)
+          ? (manualMode ? 0.12 : 0.09)
+          : (manualMode ? 0.28 : 0.22);
+        const reloadTauSec = reloadTarget01 > (s.motorReload01[i] ?? 0)
+          ? (manualMode ? 0.08 : 0.05)
+          : (manualMode ? 0.24 : 0.18);
+        s.motorWash01[i] = THREE.MathUtils.lerp(
+          s.motorWash01[i] ?? 0,
+          washTarget01,
+          1 - Math.exp(-dt / washTauSec),
+        );
+        s.motorReload01[i] = THREE.MathUtils.lerp(
+          s.motorReload01[i] ?? 0,
+          reloadTarget01,
+          1 - Math.exp(-dt / reloadTauSec),
+        );
+
+        const washLoss01 = (s.motorWash01[i] ?? 0) * (0.34 + 0.16 * lowThrottleBlend);
+        const reloadLoss01 = (s.motorReload01[i] ?? 0) * 0.24;
+        const ctLossScale = THREE.MathUtils.clamp(1 - washLoss01 - reloadLoss01, 0.42, 1.08);
+        const cqLossScale = THREE.MathUtils.clamp(
+          1 - washLoss01 * 0.7 - reloadLoss01 * 0.55,
+          0.48,
+          1.08,
+        );
+        const Ct = Ct0 * healthScale * THREE.MathUtils.clamp(1 - 0.6 * J, 0, 1.25) * ctLossScale;
+        const Cq = Cq0 * healthScale * THREE.MathUtils.clamp(1 - 0.5 * J, 0, 1.25) * cqLossScale;
 
         const thrustN = Ct * rho * n * n * Math.pow(D, 4);
         const torqueNm = Cq * rho * n * n * Math.pow(D, 5);
         mechPowerW += torqueNm * omega;
+        motorElectricalPowerW[i] = (torqueNm * omega) / Math.max(0.2, propulsion.motorEff);
+        s.motorCurrentA[i] = motorElectricalPowerW[i] / Math.max(1, Vpack);
+        propWashLossAccum += washLoss01;
+        rotorReloadLossAccum += reloadLoss01;
 
         tmpF.copy(tmpAxis).multiplyScalar(thrustN);
         Fbody.add(tmpF);
@@ -1733,6 +1633,21 @@ export const DroneModel = memo(function DroneModel({
 
         // Advance motor phase for next step (drives IMU vibration)
         s.motorPhaseRad[i] = ((s.motorPhaseRad[i] ?? 0) + omega * dt) % (Math.PI * 2);
+      }
+
+      for (const i of motorIndices) {
+        const ambientTempC = atmosphere.temperatureC;
+        const heatingRateCPerSec =
+          (motorElectricalPowerW[i] * propulsion.motorHeatFraction) /
+          Math.max(1e-6, propulsion.motorThermalCapacityJPerC);
+        const coolingRateCPerSec =
+          Math.max(0, (s.motorTempC[i] ?? ambientTempC) - ambientTempC) *
+          propulsion.motorThermalLeakPerSec *
+          Math.max(0.1, effectiveSimSettings.motorCoolingScale);
+        s.motorTempC[i] = Math.max(
+          ambientTempC,
+          (s.motorTempC[i] ?? ambientTempC) + (heatingRateCPerSec - coolingRateCPerSec) * dt,
+        );
       }
 
       // Export audio telemetry (physics-driven).
@@ -1749,14 +1664,10 @@ export const DroneModel = memo(function DroneModel({
       // Net force in world (gravity is handled by Rapier).
       const thrustWorld = Fbody.clone().applyQuaternion(s.quat);
 
-      // Height above ground (AGL) of the collider bottom.
-      const colliderLocalY = assemblyColliderCenterY - massProps.comMm.y; // mm
-      const bottomAGLM =
-        s.posM.y + (colliderLocalY - assemblyHalfExtents[1]) * 1e-3;
-
       let groundEffectMult = 1;
       let windVelWorld = new THREE.Vector3(0, 0, 0);
       let airspeedMS = s.velM.length();
+      let gustMS = 0;
 
       // Ground effect: thrust augmentation when altitude < 1 rotor diameter.
       // Based on Cheeseman & Bennett (1955): T_ge/T = 1 / (1 - (R/(4*z))^2)
@@ -1785,20 +1696,26 @@ export const DroneModel = memo(function DroneModel({
 
       // Wind model (m/s): light gusts that slowly vary.
       {
-        if (!s.windPhase)
-          s.windPhase = [Math.random() * 100, Math.random() * 100, Math.random() * 100];
+        if (!s.windPhase) {
+          s.windPhase = [rand01() * 100, rand01() * 100, rand01() * 100];
+        }
         const windT = (s.windTime ?? 0) + dt;
         s.windTime = windT;
 
-        // Perlin-like smooth wind using sin of different frequencies
-        const wx = 0.12 * Math.sin(windT * 0.4 + s.windPhase[0]) +
-          0.06 * Math.sin(windT * 1.1 + 7);
-        const wz = 0.12 * Math.sin(windT * 0.35 + s.windPhase[2]) +
-          0.06 * Math.sin(windT * 0.9 + 3);
+        const windField = computeWindField({
+          preset: effectiveSimSettings.environmentPreset,
+          timeSec: windT,
+          positionM: s.posM,
+          meanWindMS: effectiveSimSettings.meanWindMS,
+          gustAmplitudeMS: effectiveSimSettings.gustAmplitudeMS,
+          turbulenceMS: effectiveSimSettings.turbulenceMS,
+          phases: s.windPhase,
+        });
+        gustMS = windField.gustMS;
 
         // Shield wind close to the ground (AGL).
         const altFactor = THREE.MathUtils.smoothstep(Math.max(0, bottomAGLM), 0, 1.5);
-        windVelWorld = new THREE.Vector3(wx * altFactor, 0, wz * altFactor);
+        windVelWorld = windField.velocityWorld.multiplyScalar(altFactor);
       }
 
       // Quadratic aerodynamic drag from RELATIVE airspeed: v_rel = v - wind.
@@ -1806,13 +1723,15 @@ export const DroneModel = memo(function DroneModel({
       const vRel = s.velM.clone().sub(windVelWorld);
       airspeedMS = vRel.length();
       const dragWorld = airspeedMS > 1e-6
-        ? vRel.clone().multiplyScalar(-0.5 * rho * CdA * airspeedMS)
+        ? vRel.clone().multiplyScalar(
+          -0.5 * rho * CdA * (1 + structureDamage01 * 0.9 + s.batteryDamage01 * 0.22) * airspeedMS,
+        )
         : new THREE.Vector3(0, 0, 0);
 
       // Apply forces/torques to Rapier.
       // Rapier world uses mm, so: 1 N -> 1000 (kg*mm/s^2), 1 N*m -> 1e6 (kg*mm^2/s^2)
+      const forceWorldN = thrustWorld.clone().add(dragWorld);
       {
-        const forceWorldN = thrustWorld.clone().add(dragWorld);
         const torqueWorldNm = torqueBodyNm.clone().applyQuaternion(s.quat);
 
         body.resetForces(true);
@@ -1835,41 +1754,231 @@ export const DroneModel = memo(function DroneModel({
         );
       }
 
-      // Publish flight telemetry for UI (no DevTools required).
-      if (flightTelemetryRef) {
-        flightTelemetryTickRef.current.t += dt;
-        if (flightTelemetryTickRef.current.t >= 0.05) {
-          flightTelemetryTickRef.current.t = 0;
-          const weightN = massKg * g;
-          const thrustN = Math.max(0, thrustWorld.y);
-          const tw = weightN > 1e-6 ? thrustN / weightN : 0;
-          flightTelemetryRef.current = {
-            throttle01: s.throttle01,
-            thrustN,
-            weightN,
-            tw,
-            altitudeM: Math.max(0, bottomAGLM),
-            speedMS: s.velM.length(),
-            airspeedMS,
-            windMS: windVelWorld.length(),
-            groundEffectMult,
-            batteryV: s.batteryV,
-            batteryI: s.batteryI,
-            armed: s.armed,
-          };
+      {
+        const accelBody = forceWorldN
+          .clone()
+          .divideScalar(Math.max(1e-6, massKg))
+          .applyQuaternion(s.quat.clone().invert());
+        const accelWorld = forceWorldN.clone().divideScalar(Math.max(1e-6, massKg));
+        const gyroWorldDpsVec = s.omegaBody
+          .clone()
+          .applyQuaternion(s.quat)
+          .multiplyScalar(THREE.MathUtils.RAD2DEG);
+        const magBody = magneticFieldWorldVector().applyQuaternion(s.quat.clone().invert());
+        const headingDeg = THREE.MathUtils.euclideanModulo(
+          THREE.MathUtils.radToDeg(Math.atan2(magBody.x, magBody.z)),
+          360,
+        );
+        s.gpsSampleAgeSec += dt;
+        s.baroSampleAgeSec += dt;
+        s.rangefinderSampleAgeSec += dt;
+        s.magnetometerSampleAgeSec += dt;
+        s.gyroSampleAgeSec += dt;
+        s.accelSampleAgeSec += dt;
+        impactDebugRef.current.ageSec += dt;
+
+        if (effectiveSimSettings.gpsEnabled) {
+          s.gpsTimer += dt;
+          const gpsPeriodSec = 1 / Math.max(1, effectiveSimSettings.gpsRateHz);
+          if (s.gpsTimer >= gpsPeriodSec) {
+            s.gpsTimer = 0;
+            s.gpsAltitudeM = Math.max(0, bottomAGLM + randN(0.35 * sensorNoiseScale));
+            s.gpsSpeedMS = Math.max(0, s.velM.length() + randN(0.12 * sensorNoiseScale));
+            s.gpsSamplePosM.set(
+              s.posM.x + randN(0.26 * sensorNoiseScale),
+              s.gpsAltitudeM,
+              s.posM.z + randN(0.26 * sensorNoiseScale),
+            );
+            s.gpsSampleAgeSec = 0;
+          }
+        } else {
+          s.gpsAltitudeM = 0;
+          s.gpsSpeedMS = 0;
+          s.gpsSampleAgeSec = Number.POSITIVE_INFINITY;
+        }
+
+        if (effectiveSimSettings.barometerEnabled) {
+          s.baroTimer += dt;
+          if (s.baroTimer >= 1 / 25) {
+            s.baroTimer = 0;
+            const measuredPressurePa = atmosphere.pressurePa + randN(10 * sensorNoiseScale);
+            s.baroAltitudeM = pressureToAltitudeM(measuredPressurePa, effectiveSimSettings.ambientTempC);
+            s.baroSampleAgeSec = 0;
+          }
+        } else {
+          s.baroAltitudeM = 0;
+          s.baroSampleAgeSec = Number.POSITIVE_INFINITY;
+        }
+
+        if (effectiveSimSettings.rangefinderEnabled) {
+          s.rangefinderTimer += dt;
+          if (s.rangefinderTimer >= 1 / 30) {
+            s.rangefinderTimer = 0;
+            const bodyDownWorld = new THREE.Vector3(0, -1, 0).applyQuaternion(s.quat);
+            const downCos = Math.max(0.2, -bodyDownWorld.y);
+            s.rangefinderM = bottomAGLM < 40
+              ? Math.max(0, bottomAGLM / downCos + randN(0.015 * sensorNoiseScale))
+              : 0;
+            s.rangefinderSampleAgeSec = 0;
+          }
+        } else {
+          s.rangefinderM = 0;
+          s.rangefinderSampleAgeSec = Number.POSITIVE_INFINITY;
+        }
+
+        if (effectiveSimSettings.magnetometerEnabled) {
+          s.magnetometerTimer += dt;
+          if (s.magnetometerTimer >= 1 / 40) {
+            s.magnetometerTimer = 0;
+            s.headingDeg = headingDeg + randN(1.4 * sensorNoiseScale);
+            s.magnetometerSampleAgeSec = 0;
+          }
+        } else {
+          s.headingDeg = 0;
+          s.magnetometerSampleAgeSec = Number.POSITIVE_INFINITY;
+        }
+
+        s.imuTimer += dt;
+        if (s.imuTimer >= 1 / 120) {
+          s.imuTimer = 0;
+          s.gyroDps = omegaMeas.length() * THREE.MathUtils.RAD2DEG + randN(0.9 * sensorNoiseScale);
+          s.accelMS2 = accelBody.length() + randN(0.18 * sensorNoiseScale);
+          s.gyroSampleAgeSec = 0;
+          s.accelSampleAgeSec = 0;
+        }
+
+        // Publish flight telemetry for UI (no DevTools required).
+        if (flightTelemetryRef) {
+          flightTelemetryTickRef.current.t += dt;
+          if (flightTelemetryTickRef.current.t >= 0.05) {
+            flightTelemetryTickRef.current.t = 0;
+            const weightN = massKg * g;
+            const thrustN = Math.max(0, thrustWorld.y);
+            const tw = weightN > 1e-6 ? thrustN / weightN : 0;
+            const avgMotorTempC =
+              (s.motorTempC[0] + s.motorTempC[1] + s.motorTempC[2] + s.motorTempC[3]) / 4;
+            const peakMotorTempC = Math.max(...s.motorTempC);
+            const lastImpactPointMm = impactDebugRef.current.pointMm;
+            const lastImpactNormalWorld = impactDebugRef.current.normalWorld;
+            const lastImpactForceWorldN = impactDebugRef.current.forceWorldN;
+            flightTelemetryRef.current = {
+              throttle01: s.throttle01,
+              thrustN,
+              weightN,
+              tw,
+              altitudeM: Math.max(0, bottomAGLM),
+              speedMS: s.velM.length(),
+              airspeedMS,
+              windMS: windVelWorld.length(),
+              groundEffectMult,
+              batteryV: s.batteryV,
+              batteryI: s.batteryI,
+              batterySagV: Math.max(0, Vopen - s.batteryV),
+              totalMassG: massKg * 1000,
+              armed: s.armed,
+              ambientTempC: atmosphere.temperatureC,
+              pressurePa: atmosphere.pressurePa,
+              airDensityKgM3: atmosphere.densityKgM3,
+              gustMS,
+              actuatorSpreadPct,
+              gpsAltitudeM: s.gpsAltitudeM,
+              gpsSpeedMS: s.gpsSpeedMS,
+              baroAltitudeM: s.baroAltitudeM,
+              rangefinderM: s.rangefinderM,
+              headingDeg: s.headingDeg,
+              gyroDps: s.gyroDps,
+              accelMS2: s.accelMS2,
+              motorTempsC: [
+                s.motorTempC[0],
+                s.motorTempC[1],
+                s.motorTempC[2],
+                s.motorTempC[3],
+              ],
+              motorCurrentsA: [
+                s.motorCurrentA[0],
+                s.motorCurrentA[1],
+                s.motorCurrentA[2],
+                s.motorCurrentA[3],
+              ],
+              avgMotorTempC,
+              peakMotorTempC,
+              structureDamagePct: structureDamage01 * 100,
+              motorDamagePct: meanMotorDamage01 * 100,
+              batteryDamagePct: s.batteryDamage01 * 100,
+              fracturedArms: fracturedArmCount,
+              currentLimitA: effectiveSimSettings.motorCurrentLimitA,
+              currentLimitScale: Math.min(...s.currentLimitScale01),
+              thermalLimitScale: Math.min(...s.thermalLimitScale01),
+              ...createSimSettingsTelemetrySnapshot(effectiveSimSettings, {
+                buildMotorKV: propulsion.motorKV,
+                buildBatteryCells: propulsion.batteryCells,
+                buildPropPitchIn: propulsion.propPitchIn,
+                buildPackResistanceMilliOhm: propulsion.packRintOhm * 1000,
+                rotorInertiaScale: propulsion.rotorInertiaScale,
+                acroRateDegPerSec,
+                acroExpo,
+                airmodeStrength,
+                propWashCoupling,
+              }),
+              propWashLoss: propWashLossAccum / 4,
+              rotorReloadLoss: rotorReloadLossAccum / 4,
+              gpsSampleAgeSec: s.gpsSampleAgeSec,
+              baroSampleAgeSec: s.baroSampleAgeSec,
+              rangefinderSampleAgeSec: s.rangefinderSampleAgeSec,
+              magnetometerSampleAgeSec: s.magnetometerSampleAgeSec,
+              gyroSampleAgeSec: s.gyroSampleAgeSec,
+              accelSampleAgeSec: s.accelSampleAgeSec,
+              positionMm: [s.posM.x * 1000, s.posM.y * 1000, s.posM.z * 1000],
+              gpsPositionMm: [
+                s.gpsSamplePosM.x * 1000,
+                s.gpsSamplePosM.y * 1000,
+                s.gpsSamplePosM.z * 1000,
+              ],
+              thrustWorldN: [thrustWorld.x, thrustWorld.y, thrustWorld.z],
+              dragWorldN: [dragWorld.x, dragWorld.y, dragWorld.z],
+              windWorldMS: [windVelWorld.x, windVelWorld.y, windVelWorld.z],
+              velocityWorldMS: [s.velM.x, s.velM.y, s.velM.z],
+              accelWorldMS2: [accelWorld.x, accelWorld.y, accelWorld.z],
+              gyroWorldDpsVec: [gyroWorldDpsVec.x, gyroWorldDpsVec.y, gyroWorldDpsVec.z],
+              bodyUpWorld: [
+                new THREE.Vector3(0, 1, 0).applyQuaternion(s.quat).x,
+                new THREE.Vector3(0, 1, 0).applyQuaternion(s.quat).y,
+                new THREE.Vector3(0, 1, 0).applyQuaternion(s.quat).z,
+              ],
+              headingWorld: [
+                Math.sin(THREE.MathUtils.degToRad(s.headingDeg)),
+                0,
+                Math.cos(THREE.MathUtils.degToRad(s.headingDeg)),
+              ],
+              collisionHalfExtentsMm: assemblyHalfExtents,
+              collisionCenterMm: [
+                s.posM.x * 1000 + flightColliderOffset[0],
+                s.posM.y * 1000 + assemblyColliderCenterY + flightColliderOffset[1],
+                s.posM.z * 1000 + flightColliderOffset[2],
+              ],
+              ...(lastImpactPointMm ? { lastImpactPointMm } : {}),
+              ...(lastImpactNormalWorld ? { lastImpactNormalWorld } : {}),
+              ...(lastImpactForceWorldN ? { lastImpactForceWorldN } : {}),
+              lastImpactForceN: impactDebugRef.current.forceN,
+              lastImpactAgeSec: impactDebugRef.current.ageSec,
+              contactCount: impactDebugRef.current.contactCount,
+            };
+          }
         }
       }
 
       // Battery sag (very simplified but causal): V = Voc - I*R, I from mechanical power/eff.
       {
-        const Pel = mechPowerW / Math.max(0.2, propulsion.motorEff);
+        const Pel = motorElectricalPowerW.reduce((sum, value) => sum + value, 0);
+        const effectivePackRintOhm =
+          propulsion.packRintOhm * (1 + s.batteryDamage01 * 1.6 + structureDamage01 * 0.18);
         let V = Vpack;
         let I = 0;
         for (let k = 0; k < 2; k++) {
           I = Pel / Math.max(1, V);
           V = Math.max(
             propulsion.batteryCells * 3.3,
-            Math.min(Vopen, Vopen - I * propulsion.packRintOhm),
+            Math.min(Vopen, Vopen - I * effectivePackRintOhm),
           );
         }
         s.batteryV = V;
@@ -1877,8 +1986,23 @@ export const DroneModel = memo(function DroneModel({
       }
 
       // Visual: spin propellers based on motor angular velocity
-      for (let i = 0; i < 4; i++) {
+      for (const i of motorIndices) {
+        const motorAssembly = motorAssemblyRefs.current[i];
         const propGroup = propGroupRefs.current[i];
+        const armDamage01 = THREE.MathUtils.clamp(s.armDamage01[i] ?? 0, 0, 1);
+        const motorDamage01 = THREE.MathUtils.clamp(s.motorDamage01[i] ?? 0, 0, 1);
+        if (motorAssembly) {
+          const tiltSignX = i < 2 ? -1 : 1;
+          const tiltSignZ = i % 2 === 0 ? -1 : 1;
+          const droopMm = THREE.MathUtils.lerp(0, 5.5, armDamage01) + (armDamage01 >= 0.98 ? 4 : 0);
+          const yawSkewRad = THREE.MathUtils.degToRad(THREE.MathUtils.lerp(0, 4, motorDamage01));
+          motorAssembly.position.y = -droopMm;
+          motorAssembly.rotation.set(
+            THREE.MathUtils.degToRad(tiltSignX * armDamage01 * 10),
+            tiltSignZ * yawSkewRad,
+            THREE.MathUtils.degToRad(tiltSignZ * (armDamage01 * 13 + motorDamage01 * 5)),
+          );
+        }
         if (!propGroup) continue;
         const isCW = i === 0 || i === 2;
         const dir = isCW ? 1 : -1;
@@ -1919,40 +2043,20 @@ export const DroneModel = memo(function DroneModel({
       }
       // Non-flight modes: don't kinematically override transforms (Rapier may be driving bodies).
       // Idle: stop prop spin visuals
-      for (let i = 0; i < 4; i++) {
+      for (const i of motorIndices) {
+        const motorAssembly = motorAssemblyRefs.current[i];
         const propGroup = propGroupRefs.current[i];
+        if (motorAssembly) {
+          motorAssembly.position.y = 0;
+          motorAssembly.rotation.set(0, 0, 0);
+        }
         if (!propGroup) continue;
         propGroup.rotation.y = 0;
         propSpinRad.current[i] = 0;
       }
     }
 
-    // Audio update (runs in all modes; audible only when enabled).
-    if (audioRef.current) {
-      const nodes = audioRef.current;
-      const tel = audioTelemetry.current;
-
-      const enabled = effectiveSimSettings.motorAudioEnabled && viewMode === "flight_sim";
-      const masterTarget = enabled ? clamp01(effectiveSimSettings.motorAudioVolume) : 0;
-      nodes.master.gain.setTargetAtTime(Math.max(0.0001, masterTarget), nodes.ctx.currentTime, 0.02);
-
-      const blades = 3;
-      const omegaMax = Math.max(1e-3, tel.omegaMaxRad);
-      for (let i = 0; i < 4; i++) {
-        const omega = Math.max(0, tel.omegaRad[i] ?? 0);
-        const rps = omega / (2 * Math.PI);
-        const bpf = Math.max(0, rps * blades);
-        nodes.motorOsc[i].frequency.setTargetAtTime(bpf, nodes.ctx.currentTime, 0.015);
-
-        const oNorm = clamp01(omega / omegaMax);
-        const gain = enabled ? 0.08 * Math.pow(oNorm, 1.3) : 0;
-        nodes.motorGain[i].gain.setTargetAtTime(gain, nodes.ctx.currentTime, 0.02);
-      }
-
-      const powerNorm = clamp01(Math.sqrt(Math.max(0, tel.mechPowerW)) / 80);
-      const noiseGain = enabled ? 0.05 * powerNorm : 0;
-      nodes.noiseGain.gain.setTargetAtTime(noiseGain, nodes.ctx.currentTime, 0.03);
-    }
+    updateMotorAudio();
   });
 
   const v = isPrintLayout
@@ -1963,6 +2067,9 @@ export const DroneModel = memo(function DroneModel({
         accessories: showTPU,
       }
     : effectiveViewSettings.visibility;
+  const invalidTargetSet = useMemo(() => new Set(invalidTargets), [invalidTargets]);
+  const isInvalidTarget = (...targets: InspectTarget[]) =>
+    targets.some((target) => invalidTargetSet.has(target));
   const droneVisual = (
     <group
       ref={groupRef}
@@ -2188,7 +2295,11 @@ export const DroneModel = memo(function DroneModel({
                 pos[2] + bottomPos[2] + explodeMotorZ,
               ]}
             >
-              <group>
+              <group
+                ref={(el) => {
+                  motorAssemblyRefs.current[i] = el;
+                }}
+              >
                 {exploded && i === 0 && (
                   <Annotation
                     title="Motors + Props"
@@ -2321,7 +2432,7 @@ export const DroneModel = memo(function DroneModel({
             ]}
           >
             {/* FC Stack M3 screws + grommets (4×) */}
-            {[[-1, -1], [-1, 1], [1, -1], [1, 1]].map(([dx, dz], si) => {
+            {([[-1, -1], [-1, 1], [1, -1], [1, 1]] as const).map(([dx, dz], si) => {
               const sx = dx * fcMounting / 2;
               const sz = dz * fcMounting / 2;
               return (
@@ -2401,13 +2512,106 @@ export const DroneModel = memo(function DroneModel({
                 />
               </>
             )}
-            {viewMode !== "exploded" && (
-              <Annotation
-                title="Flight Controller Stack"
-                description={`${fcMounting}×${fcMounting}mm ESC & FC`}
-                position={[fcMounting / 2 + 10, 12, 0]}
-              />
-            )}
+          </group>
+          )}
+
+          {v.electronics && (
+          <group>
+            <group
+              position={[
+                topPos[0],
+                topPos[1] + topPlateTopY + 24 + explodeCameraY * 0.4,
+                topPos[2] - fcMounting / 2 - 18,
+              ]}
+            >
+              <mesh castShadow receiveShadow>
+                <cylinderGeometry args={[6, 6, 34, 16]} />
+                <meshStandardMaterial color="#3f3f46" roughness={0.78} metalness={0.18} />
+              </mesh>
+              <mesh position={[0, 22, 0]} castShadow receiveShadow>
+                <cylinderGeometry args={[11, 11, 4, 24]} />
+                <meshStandardMaterial
+                  color={effectiveSimSettings.gpsEnabled ? "#9ca3af" : "#52525b"}
+                  roughness={0.72}
+                  metalness={0.08}
+                />
+              </mesh>
+              <mesh position={[0, 18, 0]} castShadow receiveShadow>
+                <cylinderGeometry args={[5, 5, 3, 16]} />
+                <meshStandardMaterial
+                  color={effectiveSimSettings.magnetometerEnabled ? "#6b7280" : "#52525b"}
+                  roughness={0.7}
+                  metalness={0.08}
+                />
+              </mesh>
+              {viewMode === "exploded" && (
+                <Annotation
+                  title="GNSS + Magnetometer Mast"
+                  description="Raised puck keeps magnetic sensing clear of ESC noise and props"
+                  position={[18, 26, 0]}
+                />
+              )}
+            </group>
+
+            <group
+              position={[
+                bottomPos[0] + 6,
+                bottomPos[1] + bottomPlateTopY + 13 + explodeStackY,
+                bottomPos[2] + 4,
+              ]}
+            >
+              <mesh castShadow receiveShadow>
+                <boxGeometry args={[5, 0.8, 5]} />
+                <meshStandardMaterial
+                  color={effectiveSimSettings.barometerEnabled ? "#a3a3a3" : "#3f3f46"}
+                  roughness={0.84}
+                  metalness={0.08}
+                />
+              </mesh>
+              <mesh position={[-7, 0, -5]} castShadow receiveShadow>
+                <boxGeometry args={[4.4, 0.9, 4.4]} />
+                <meshStandardMaterial color="#18181b" roughness={0.9} metalness={0.08} />
+              </mesh>
+              {viewMode === "exploded" && (
+                <Annotation
+                  title="IMU + Barometer Package"
+                  description="Board-level inertial core and pressure port on the FC stack"
+                  position={[18, 6, 0]}
+                />
+              )}
+            </group>
+
+            <group
+              position={[
+                bottomPos[0],
+                bottomPos[1] - 6,
+                bottomPos[2] + 6,
+              ]}
+            >
+              <mesh castShadow receiveShadow>
+                <boxGeometry args={[14, 4, 18]} />
+                <meshStandardMaterial
+                  color={effectiveSimSettings.rangefinderEnabled ? "#a3a3a3" : "#3f3f46"}
+                  roughness={0.8}
+                  metalness={0.08}
+                />
+              </mesh>
+              <mesh position={[-3.5, -1.8, 8.5]} castShadow receiveShadow>
+                <cylinderGeometry args={[2.3, 2.3, 1.2, 16]} />
+                <meshStandardMaterial color="#0f172a" metalness={0.35} roughness={0.28} />
+              </mesh>
+              <mesh position={[3.5, -1.8, 8.5]} castShadow receiveShadow>
+                <cylinderGeometry args={[2.3, 2.3, 1.2, 16]} />
+                <meshStandardMaterial color="#0f172a" metalness={0.35} roughness={0.28} />
+              </mesh>
+              {viewMode === "exploded" && (
+                <Annotation
+                  title="Downward Rangefinder"
+                  description="Dual-aperture altimeter for low-hover and landing work"
+                  position={[0, -12, 18]}
+                />
+              )}
+            </group>
           </group>
           )}
 
@@ -2453,21 +2657,25 @@ export const DroneModel = memo(function DroneModel({
                 <meshStandardMaterial color="#1e3a5f" roughness={0.1} metalness={0.3} />
               </mesh>
               {/* FOV Cone */}
-              <mesh position={[0, 0, 35]} rotation={[-Math.PI / 2, 0, 0]}>
-                <cylinderGeometry args={[40, 0.1, 40, 32]} />
-                <meshStandardMaterial
-                  color="#eab308"
-                  transparent
-                  opacity={0.08}
-                  depthWrite={false}
-                />
-              </mesh>
+              {viewMode === "exploded" && (
+                <mesh position={[0, 0, 35]} rotation={[-Math.PI / 2, 0, 0]}>
+                  <cylinderGeometry args={[40, 0.1, 40, 32]} />
+                  <meshStandardMaterial
+                    color="#d4d4d8"
+                    transparent
+                    opacity={0.05}
+                    depthWrite={false}
+                  />
+                </mesh>
+              )}
             </group>
-            <Annotation
-              title="FPV Camera"
-              description="19×19mm Micro • 30° Uptilt • 160° FOV"
-              position={[15, 0, 0]}
-            />
+            {viewMode === "exploded" && (
+              <Annotation
+                title="FPV Camera"
+                description="19×19mm Micro • 30° Uptilt • 160° FOV"
+                position={[15, 0, 0]}
+              />
+            )}
           </group>
           )}
 
@@ -2549,7 +2757,7 @@ export const DroneModel = memo(function DroneModel({
                 </mesh>
               </group>
             ))}
-            {viewMode === "exploded" ? (
+            {viewMode === "exploded" && (
               <>
                 <Annotation
                   title="LiPo Battery"
@@ -2562,16 +2770,89 @@ export const DroneModel = memo(function DroneModel({
                   position={[-25, 16, 0]}
                 />
               </>
-            ) : (
-              <Annotation
-                title="LiPo Battery"
-                description={`6S ${propSize >= 7 ? '1800' : propSize >= 5 ? '1300' : '650'}mAh Top Mount`}
-                position={[25, 0, 0]}
-              />
             )}
           </group>
           )}
         </group>
+
+        {invalidTargetSet.size > 0 && (
+          <group>
+            <InvalidPartOverlay
+              visible={isInvalidTarget("bottom_plate", "carbon_sheet")}
+              position={bottomPos}
+              size={[frameSize * 0.82, plateThickness + 8, frameSize * 0.82]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("top_plate")}
+              position={topPos}
+              size={[fcMounting + 34, topPlateThickness + 8, fcMounting + 56]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("standoffs")}
+              position={[0, standoffY, 0]}
+              size={[fcMounting + 30, standoffHeight + 10, fcMounting + 30]}
+            />
+            {motorPositions.map((pos, i) => (
+              <InvalidPartOverlay
+                key={`invalid-motor-overlay-${i}`}
+                visible={isInvalidTarget("motors_props", "reference_hardware")}
+                position={[pos[0] + bottomPos[0], bottomPos[1] + bottomPlateTopY + 18, pos[2] + bottomPos[2]]}
+                size={[(propSize * 25.4) + 18, 40, (propSize * 25.4) + 18]}
+              />
+            ))}
+            <InvalidPartOverlay
+              visible={isInvalidTarget("fc_stack")}
+              position={[bottomPos[0], bottomPos[1] + bottomPlateTopY + 10 + explodeStackY * 0.5, bottomPos[2]]}
+              size={[fcMounting + 20, Math.max(24, effectiveSimSettings.stackHeightMm + 12), fcMounting + 24]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("sensor_mast", "antenna_routing")}
+              position={[
+                topPos[0],
+                topPos[1] + topPlateTopY + 24 + explodeCameraY * 0.4,
+                topPos[2] - fcMounting / 2 - 18,
+              ]}
+              size={[26, 54, 26]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("imu_baro")}
+              position={[
+                bottomPos[0] + 2,
+                bottomPos[1] + bottomPlateTopY + 13 + explodeStackY,
+                bottomPos[2],
+              ]}
+              size={[24, 12, 20]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("rangefinder")}
+              position={[bottomPos[0], bottomPos[1] - 6, bottomPos[2] + 6]}
+              size={[22, 10, 24]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("fpv_camera", "tpu_pack")}
+              position={[
+                bottomPos[0],
+                bottomPos[1] + bottomPlateTopY + standoffHeight / 2 + explodeCameraY,
+                bottomPos[2] + fcMounting / 2 + 18,
+              ]}
+              size={[34, 28, 34]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("battery_pack")}
+              position={[
+                topPos[0],
+                topPos[1] + topPlateTopY + 15 + explodeBatteryY,
+                topPos[2],
+              ]}
+              size={[46, 38, 86]}
+            />
+            <InvalidPartOverlay
+              visible={isInvalidTarget("wiring_harness")}
+              position={[0, bottomPos[1] + bottomPlateTopY + 10, 0]}
+              size={[fcMounting + 62, standoffHeight + 16, fcMounting + 90]}
+            />
+          </group>
+        )}
 
         {/* Clearance Check Visualization */}
         {viewMode === "clearance_check" && clearanceData && (
@@ -2608,8 +2889,6 @@ export const DroneModel = memo(function DroneModel({
             })}
             {/* Clearance measurement lines */}
             {clearanceData.map((item, ci) => {
-              const color = item.severity === "fail" ? "#ef4444"
-                : item.severity === "warn" ? "#f59e0b" : "#22c55e";
               const mid = item.posA.clone().add(item.posB).multiplyScalar(0.5);
               return (
                 <group key={`clearance-line-${ci}`}>
@@ -2897,42 +3176,27 @@ export const DroneModel = memo(function DroneModel({
   );
 
   if (physicsEnabled) {
-    const RigidBody = rapier?.RigidBody;
-    const CuboidCollider = rapier?.CuboidCollider;
-
-    // If physics is requested but Rapier isn't loaded yet, still show the visual model.
-    // (App will load Rapier on-demand and re-render with physics enabled.)
-    if (!RigidBody || !CuboidCollider) {
-      return <group position={[0, flightSpawnLiftY, 0]}>{droneVisual}</group>;
-    }
-
     return (
-      <RigidBody
-        type="dynamic"
-        colliders={false}
-        ref={flightBodyRef}
-        canSleep={true}
-        mass={massProps.massKg}
-        friction={1.1}
-        restitution={0.05}
-        linearDamping={0.01}
-        angularDamping={0.01}
-        gravityScale={1}
-        position={[0, flightSpawnLiftY, 0]}
+      <DronePhysicsBody
+        rapier={rapier}
+        bodyRef={flightBodyRef}
+        massKg={massProps.massKg}
+        flightSpawnLiftY={flightSpawnLiftY}
+        colliderDensity={colliderDensity}
+        colliderHalfExtents={assemblyHalfExtents}
+        colliderPosition={[
+          flightColliderOffset[0],
+          assemblyColliderCenterY + flightColliderOffset[1],
+          flightColliderOffset[2],
+        ]}
+        onCollisionEnter={captureImpactFromCollision}
+        onCollisionExit={() => {
+          impactDebugRef.current.contactCount = 0;
+        }}
+        onContactForce={captureImpactForce}
       >
-        <CuboidCollider
-          density={colliderDensity}
-          args={assemblyHalfExtents}
-          position={[
-            flightColliderOffset[0],
-            assemblyColliderCenterY + flightColliderOffset[1],
-            flightColliderOffset[2],
-          ]}
-          friction={1.1}
-          restitution={0.05}
-        />
         {droneVisual}
-      </RigidBody>
+      </DronePhysicsBody>
     );
   }
 

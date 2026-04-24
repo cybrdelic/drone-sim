@@ -1,44 +1,71 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Drone Sim
 
-# Run and deploy your AI Studio app
+Drone Sim is a browser-based engineering lab for quadcopter frame design and
+flight testing. It combines:
 
-This contains everything you need to run your app locally.
+- parametric frame and print-layout views
+- assembly fit and structural checks
+- live flight telemetry, debug overlays, and replay inspection
+- a local MCP debug sidecar for live state reads and patches
 
-View your app in AI Studio: https://ai.studio/apps/adfc3fc8-d747-41d6-923c-e42f8406f36e
+## Run locally
 
-## Run Locally
+Prerequisites:
 
-**Prerequisites:**  Node.js
+- Node.js 20+
+- `pnpm`
 
+Install and start the app:
 
-1. Install dependencies:
-   `pnpm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `pnpm dev`
+```bash
+pnpm install
+pnpm dev
+```
 
-## MCP Live Debug/Control (VS Code)
+The Vite app runs on `http://localhost:3000`.
 
-This repo includes a local MCP server that can attach live to the running browser and:
-- read state + flight telemetry
-- toggle debug overlays (collider lines, telemetry)
-- patch UI/drone params and waypoints
+## Scripts
 
-Requirements and philosophy:
-- Prefer physics realism over hacks (no per-frame teleporting in physical modes)
-- Avoid relying on the browser console; verification is via UI telemetry/overlays
+- `pnpm dev` - start the app
+- `pnpm build` - production build
+- `pnpm preview` - preview the production build
+- `pnpm lint` - TypeScript typecheck
+- `pnpm mcp:debug` - start the local debug MCP bridge
 
-Steps:
-1) Start the MCP debug server (optional if you start it via VS Code):
-   `pnpm mcp:debug`
-2) In VS Code, ensure the workspace MCP config exists at [.vscode/mcp.json](.vscode/mcp.json), then run:
-   - `MCP: List Servers` → start `droneSimDebug` (trust prompt on first run)
-3) Start the app:
-   `pnpm dev`
-4) Open the shown localhost URL; the app auto-attaches to `ws://127.0.0.1:8787`.
+## Local MCP debug bridge
 
-Agents:
-- Physics realism agent: [.github/agents/drone-sim-physics-realism.agent.md](.github/agents/drone-sim-physics-realism.agent.md)
-- Debug/control agent: [.github/agents/drone-sim-debug.agent.md](.github/agents/drone-sim-debug.agent.md)
+The repo includes a local MCP server in
+[`tools/drone-sim-debug-mcp`](./tools/drone-sim-debug-mcp) that can attach to
+the running browser session and:
+
+- fetch UI + telemetry state
+- patch params, sim settings, view settings, and debug settings
+- set waypoints and toggle autopilot
+
+VS Code can start the sidecar from
+[`\.vscode/mcp.json`](./.vscode/mcp.json).
+
+Typical loop:
+
+1. Run `pnpm mcp:debug`
+2. Run `pnpm dev`
+3. Open the app in the browser
+4. Connect through the MCP server or the included agent docs in `.github/agents`
+
+Local debug bridge scratch files live under `.drone-sim-debug/` and are ignored
+by git.
+
+## Project layout
+
+- `src/App.tsx` - app shell and scene composition
+- `src/components/` - viewport UI, inspectors, overlays, and controls
+- `src/sim/` - shared simulation config and engineering/flight domain logic
+- `tools/drone-sim-debug-mcp/` - local MCP sidecar for live inspection/control
+
+## Physics direction
+
+This repo treats the sim as an engineering instrument, not just a visual toy:
+
+- prefer physically plausible forces over teleports or visual hacks
+- keep verification visible in-app through telemetry and overlays
+- gate unrealistic assemblies before flight mode accepts them

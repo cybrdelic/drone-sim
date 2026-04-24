@@ -1,17 +1,13 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 
-export default defineConfig(({mode}) => {
-  const env = loadEnv(mode, '.', '');
+export default defineConfig(() => {
   return {
     plugins: [react(), tailwindcss()],
     esbuild: {
       target: 'es2022',
-    },
-    define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
     },
     resolve: {
       preserveSymlinks: true,
@@ -42,16 +38,16 @@ export default defineConfig(({mode}) => {
       ],
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      // Keep HMR opt-out available for heavy in-browser editing sessions.
       hmr: process.env.DISABLE_HMR !== 'true',
     },
     build: {
       target: 'es2022',
+      chunkSizeWarningLimit: 2400,
       rollupOptions: {
         output: {
           manualChunks(id) {
-            if (!id.includes('node_modules')) return;
+            if (!id.includes('node_modules')) return undefined;
             if (/[\\/]node_modules[\\/](react|react-dom)[\\/]/.test(id)) return 'react';
             if (id.includes('three/examples')) return 'three-examples';
             if (id.includes('three-bvh-csg')) return 'csg';
@@ -59,6 +55,7 @@ export default defineConfig(({mode}) => {
             if (id.includes('@react-three/fiber') || id.includes('@react-three/drei')) return 'react-three';
             if (id.includes('three')) return 'three';
             // Let Rollup decide for the rest to avoid circular chunk graphs.
+            return undefined;
           },
         },
       },

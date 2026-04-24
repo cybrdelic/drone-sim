@@ -1,0 +1,95 @@
+import type { NumericSimControl } from "./PanelControls";
+
+export const sidebarChassisControls: readonly NumericSimControl[] = [
+  {
+    key: "buildWheelbaseMm",
+    label: "Motor-to-Motor Diagonal",
+    min: 120,
+    max: 350,
+    step: 1,
+    unit: "mm",
+  },
+  {
+    key: "buildPropSizeIn",
+    label: "Propeller Size",
+    min: 2.5,
+    max: 8,
+    step: 0.1,
+    unit: " in",
+  },
+  {
+    key: "buildBottomPlateThicknessMm",
+    label: "Bottom Plate Thickness",
+    min: 2,
+    max: 8,
+    step: 0.5,
+    unit: "mm",
+  },
+  {
+    key: "buildTopPlateThicknessMm",
+    label: "Top Plate Thickness",
+    min: 1,
+    max: 4,
+    step: 0.5,
+    unit: "mm",
+  },
+  {
+    key: "buildStandoffHeightMm",
+    label: "Standoff Height",
+    min: 15,
+    max: 40,
+    step: 1,
+    unit: "mm",
+  },
+  {
+    key: "buildArmWidthMm",
+    label: "Arm Width",
+    min: 8,
+    max: 25,
+    step: 1,
+    unit: "mm",
+  },
+];
+
+export const sidebarMassControls: readonly NumericSimControl[] = [
+  {
+    key: "buildBatteryMassG",
+    label: "Battery Mass",
+    min: 40,
+    max: 450,
+    step: 1,
+    unit: " g",
+  },
+  {
+    key: "buildMotorMassG",
+    label: "Motor Mass",
+    min: 5,
+    max: 80,
+    step: 1,
+    unit: " g",
+  },
+  {
+    key: "buildPropMassG",
+    label: "Prop Mass",
+    min: 1,
+    max: 12,
+    step: 0.1,
+    unit: " g",
+  },
+  {
+    key: "buildStackMassG",
+    label: "Stack Mass",
+    min: 5,
+    max: 60,
+    step: 1,
+    unit: " g",
+  },
+  {
+    key: "buildMiscMassG",
+    label: "Misc Mass",
+    min: 0,
+    max: 120,
+    step: 1,
+    unit: " g",
+  },
+];

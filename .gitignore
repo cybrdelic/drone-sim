@@ -8,4 +8,4 @@ coverage/
 !.env.example
 
 # Local debug bridge files
-.drone-sim-debug/send.command.json
+.drone-sim-debug/

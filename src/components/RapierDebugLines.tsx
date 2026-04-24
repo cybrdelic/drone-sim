@@ -3,6 +3,13 @@ import { useRapier } from "@react-three/rapier";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
 
+type RapierDebugWorld = {
+  debugRender?: () => {
+    vertices?: Float32Array;
+    colors?: Float32Array;
+  };
+};
+
 export function RapierDebugLines() {
   const { world } = useRapier();
   const geomRef = useRef<THREE.BufferGeometry>(null);
@@ -25,8 +32,7 @@ export function RapierDebugLines() {
 
     // Rapier exposes a debug renderer buffer.
     // The exact color format can vary (RGB or RGBA); we normalize to RGB for Three.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const buffers = (world as any).debugRender?.();
+    const buffers = (world as RapierDebugWorld).debugRender?.();
     if (!buffers) return;
 
     const vertices: Float32Array | undefined = buffers.vertices;
@@ -46,9 +52,12 @@ export function RapierDebugLines() {
       const out = scratchColor.current;
       let o = 0;
       for (let i = 0; i < colors.length; i += 4) {
-        out[o++] = colors[i];
-        out[o++] = colors[i + 1];
-        out[o++] = colors[i + 2];
+        const red = colors[i] ?? 1;
+        const green = colors[i + 1] ?? 1;
+        const blue = colors[i + 2] ?? 1;
+        out[o++] = red;
+        out[o++] = green;
+        out[o++] = blue;
       }
       rgbColors = out;
     } else {

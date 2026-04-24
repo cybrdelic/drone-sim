@@ -103,6 +103,25 @@ wss.on("connection", (ws) => {
 
 const server = new McpServer({ name: "drone-sim-debug", version: "0.0.1" });
 
+const JsonValueSchema = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(JsonValueSchema),
+    z.record(JsonValueSchema),
+  ]),
+);
+const JsonObjectSchema = z.record(JsonValueSchema);
+const ToolEnvelopeSchema = z
+  .object({
+    signal: z.unknown().optional(),
+    input: z.unknown().optional(),
+    _meta: z.unknown().optional(),
+  })
+  .passthrough();
+
 function unwrapToolArgs(args) {
   if (!args || typeof args !== "object") return args;
   // Some runners wrap tool args under `signal` or `input` and attach metadata fields.
@@ -132,15 +151,7 @@ function tryReadJson(filePath) {
   }
 }
 
-const StatusSchema = z
-  .object({
-    signal: z.any().optional(),
-    input: z.any().optional(),
-    _meta: z.any().optional(),
-  })
-  .passthrough()
-  .optional()
-  .default({});
+const StatusSchema = ToolEnvelopeSchema.optional().default({});
 
 server.tool(
   "drone_sim_debug_status",
@@ -191,13 +202,13 @@ server.tool(
 
 const SetStateSchema = z
   .object({
-    signal: z.any().optional(),
-    input: z.any().optional(),
-    _meta: z.any().optional(),
-    params: z.record(z.any()).optional(),
-    viewSettings: z.record(z.any()).optional(),
-    simSettings: z.record(z.any()).optional(),
-    debugSettings: z.record(z.any()).optional(),
+    signal: z.unknown().optional(),
+    input: z.unknown().optional(),
+    _meta: z.unknown().optional(),
+    params: JsonObjectSchema.optional(),
+    viewSettings: JsonObjectSchema.optional(),
+    simSettings: JsonObjectSchema.optional(),
+    debugSettings: JsonObjectSchema.optional(),
     waypoints: z
       .array(
         z.object({
@@ -259,10 +270,10 @@ server.tool(
 
 const SendSchema = z
   .object({
-    signal: z.any().optional(),
-    input: z.any().optional(),
-    _meta: z.any().optional(),
-    command: z.record(z.any()).optional(),
+    signal: z.unknown().optional(),
+    input: z.unknown().optional(),
+    _meta: z.unknown().optional(),
+    command: JsonObjectSchema.optional(),
     timeoutMs: z.number().optional(),
   })
   .passthrough();

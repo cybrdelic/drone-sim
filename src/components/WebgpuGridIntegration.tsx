@@ -1,63 +1,73 @@
-import { useFrame, useThree } from "@react-three/fiber";
-import { useEffect, useMemo } from "react";
-import { createWebgpuGridEnvironment, createWebgpuGridPostProcessing } from "webgpu-grid";
+import { useThree } from "@react-three/fiber";
+import { useEffect } from "react";
+import * as THREE from "three";
 
 /**
- * Mounts the webgpu-grid environment (fog + 4-point rig + etched floor) into the
- * existing R3F scene, and replaces the default render with the webgpu-grid
- * RenderPipeline post-processing.
+ * Lightweight in-repo showroom environment.
  *
- * Drone-sim world units are millimeters, while webgpu-grid defaults are meters,
- * so we scale by 1000.
+ * This replaces the old sibling-repo `webgpu-grid` dependency so the project
+ * stays self-contained while preserving a clean presentation surface for
+ * non-flight inspection modes.
  */
-export function WebgpuGridIntegration({ unitScale = 1000 }: { unitScale?: number }) {
-  const { gl, scene, camera } = useThree();
-
-  const stateOverrides = useMemo(
-    () => ({
-      qualityPreset: "balanced" as const,
-      maxPixelRatio: 1.35,
-      shadowMapResolution: 1024,
-      textureAnisotropy: 4,
-      // Drone-sim uses millimeter world units, so the etched showroom floor becomes
-      // excessively dense and shimmers under motion if we keep the package defaults.
-      useGridEtching: false,
-      aoEnabled: false,
-      bloomEnabled: false,
-    }),
-    [],
-  );
-
-  const integration = useMemo(() => {
-    // NOTE: gl is a Three WebGPURenderer (with WebGL2 fallback backend).
-    const env = createWebgpuGridEnvironment({
-      renderer: gl as any,
-      scene: scene as any,
-      unitScale,
-      stateOverrides,
-    });
-
-    const pp = createWebgpuGridPostProcessing({
-      renderer: gl as any,
-      scene: scene as any,
-      camera: camera as any,
-      stateOverrides,
-    });
-
-    return { env, pp };
-  }, [gl, scene, camera, unitScale, stateOverrides]);
+export function WebgpuGridIntegration({
+  unitScale = 1000,
+}: {
+  unitScale?: number;
+}) {
+  const scene = useThree((state) => state.scene);
+  const floorSize = unitScale * 24;
+  const fogNear = unitScale * 4;
+  const fogFar = unitScale * 18;
 
   useEffect(() => {
+    const previousFog = scene.fog;
+    const fog = new THREE.Fog("#d8e0ea", fogNear, fogFar);
+    scene.fog = fog;
+
     return () => {
-      integration.pp.dispose();
-      integration.env.dispose();
+      if (scene.fog === fog) {
+        scene.fog = previousFog ?? null;
+      }
     };
-  }, [integration]);
+  }, [fogFar, fogNear, scene]);
 
-  // Taking over render by using a positive priority disables R3F's internal render.
-  useFrame(() => {
-    integration.pp.render();
-  }, 1);
-
-  return null;
+  return (
+    <group>
+      <ambientLight intensity={0.82} color="#f6fbff" />
+      <hemisphereLight
+        intensity={0.58}
+        color="#f8fbff"
+        groundColor="#7c8ea3"
+      />
+      <directionalLight
+        castShadow
+        color="#eef6ff"
+        intensity={1.9}
+        position={[3600, 6200, 2600]}
+        shadow-mapSize-width={1536}
+        shadow-mapSize-height={1536}
+      />
+      <directionalLight
+        intensity={0.8}
+        color="#dce8f6"
+        position={[-2400, 2800, -1600]}
+      />
+      <mesh
+        receiveShadow
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, -0.02, 0]}
+      >
+        <planeGeometry args={[floorSize, floorSize]} />
+        <meshStandardMaterial
+          color="#dde5ee"
+          roughness={0.94}
+          metalness={0.03}
+        />
+      </mesh>
+      <gridHelper
+        args={[floorSize, 64, "#8ea0b5", "#c4d0dd"]}
+        position={[0, 0.1, 0]}
+      />
+    </group>
+  );
 }
