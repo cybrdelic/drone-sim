@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "droneSimDebug": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/tools/drone-sim-debug-mcp/src/index.mjs"
+      ]
+    }
+  }
+}
